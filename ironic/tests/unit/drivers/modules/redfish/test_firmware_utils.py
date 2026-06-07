@@ -180,6 +180,27 @@ class FirmwareUtilsTestCase(base.TestCase):
     @mock.patch.object(tempfile, 'gettempdir', autospec=True)
     @mock.patch.object(os, 'makedirs', autospec=True)
     @mock.patch.object(image_service, 'HttpImageService', autospec=True)
+    def test_download_to_temp_https(
+            self, mock_http_image_service, mock_makedirs, mock_gettempdir):
+        node = mock.Mock(uuid='9f0f6795-f74e-4b5a-850e-72f586a92435')
+        mock_gettempdir.return_value = '/tmp'
+        http_url = 'https://example.com/bios.exe'
+
+        with mock.patch.object(firmware_utils, 'open', mock.mock_open(),
+                               create=True) as mock_open:
+            result = firmware_utils.download_to_temp(node, http_url)
+
+            exp_result = '/tmp/9f0f6795-f74e-4b5a-850e-72f586a92435/bios.exe'
+            exp_temp_dir = '/tmp/9f0f6795-f74e-4b5a-850e-72f586a92435'
+            mock_makedirs.assert_called_with(exp_temp_dir, exist_ok=True)
+            self.assertEqual(result, exp_result)
+            mock_http_image_service.return_value.download.assert_called_with(
+                http_url, mock_open.return_value)
+            mock_open.assert_has_calls([mock.call(exp_result, 'wb')])
+
+    @mock.patch.object(tempfile, 'gettempdir', autospec=True)
+    @mock.patch.object(os, 'makedirs', autospec=True)
+    @mock.patch.object(image_service, 'HttpImageService', autospec=True)
     @mock.patch.object(swift, 'SwiftAPI', autospec=True)
     def test_download_to_temp_swift(
             self, mock_swift_api, mock_http_image_service, mock_makedirs,
