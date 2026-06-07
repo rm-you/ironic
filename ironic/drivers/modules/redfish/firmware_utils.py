@@ -156,7 +156,7 @@ def download_to_temp(node, url):
     """
     parsed_url = urlparse.urlparse(url)
     scheme = parsed_url.scheme.lower()
-    if scheme not in ('http', 'swift', 'file'):
+    if scheme not in ('http', 'https', 'swift', 'file'):
         raise exception.InvalidParameterValue(
             _('%(scheme)s is not supported for %(url)s.')
             % {'scheme': scheme, 'url': parsed_url.geturl()})
@@ -169,7 +169,7 @@ def download_to_temp(node, url):
     LOG.debug('For node %(node)s firmware at %(url)s will be downloaded to '
               'temporary location at %(temp_file)s',
               {'node': node.uuid, 'url': url, 'temp_file': temp_file})
-    if scheme == 'http':
+    if scheme in ('http', 'https'):
         with open(temp_file, 'wb') as tf:
             image_service.HttpImageService().download(url, tf)
     elif scheme == 'swift':
