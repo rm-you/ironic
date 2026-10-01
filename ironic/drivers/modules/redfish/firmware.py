@@ -1954,6 +1954,10 @@ class RedfishFirmware(base.FirmwareInterface):
             # For remaining, download the image to temporary location
             temp_file = firmware_utils.download_to_temp(node, url)
 
+            checksum = component_update.get('checksum')
+            if checksum:
+                firmware_utils.verify_checksum(node, checksum, temp_file)
+
             return firmware_utils.stage(node, source, temp_file)
 
         except exception.IronicException:

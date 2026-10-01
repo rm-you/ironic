@@ -88,6 +88,7 @@ Each firmware image dictionary is of the form::
     {
       "component": "The desired component to have the firmware updated, supported components are listed below",
       "url": "<URL of firmware image file>",
+      "checksum": "<Optional SHA1, SHA256 or SHA512 checksum of the file>",
       "wait": <Optional time in seconds to wait after applying update>
     }
 
@@ -100,7 +101,15 @@ Each firmware image dictionary is of the form::
     "nic:<NIC_REDFISH_ID>", "Since machines can have multiple NICs, we use **nic:** as prefix plus the **NIC_REDFISH_ID** to identify the NIC to update"
 
 The ``component`` and ``url`` arguments in the firmware image dictionary are
-mandatory, while the ``wait`` argument is optional.
+mandatory, while the ``checksum`` and ``wait`` arguments are optional.
+
+When ``checksum`` is set and the conductor downloads the file to stage it
+(``[redfish]firmware_source`` is ``local``, or the URL scheme differs from the
+configured source), the file is verified against it before it is offered to
+the BMC, and the step fails on a mismatch. When the BMC downloads the file
+from its original location (``http`` source with an ``http`` or ``https`` URL,
+or ``swift`` source with a ``swift`` URL), the conductor never reads the file
+and the checksum is not verified.
 
 For ``url`` currently ``http``, ``https``, ``swift`` and ``file`` schemes are
 supported.

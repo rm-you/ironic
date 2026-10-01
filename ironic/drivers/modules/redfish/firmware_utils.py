@@ -88,6 +88,12 @@ _FIRMWARE_INTERFACE_UPDATE_SCHEMA = {
                 "type": "string",
                 "minLength": 1
             },
+            "checksum": {
+                "description": "optional SHA1, SHA256 or SHA512 checksum "
+                "for firmware file, verified when the file is staged",
+                "type": "string",
+                "minLength": 1
+            },
             "wait": {
                 "description": "optional wait time for firmware update",
                 "type": "integer",

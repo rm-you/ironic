@@ -1,0 +1,9 @@
+---
+features:
+  - |
+    The ``update`` step of the ``redfish`` firmware interface accepts an
+    optional ``checksum`` (SHA1, SHA256 or SHA512) for each component. When
+    the conductor stages the firmware file, it verifies the file against the
+    checksum before offering it to the BMC, and fails the step on a mismatch.
+    A file the BMC downloads from its original location is not verified.
+    See `bug 2162823 <https://bugs.launchpad.net/ironic/+bug/2162823>`_.
