@@ -509,6 +509,31 @@ class FirmwareUtilsTestCase(base.TestCase):
         ]
         firmware_utils.validate_firmware_interface_update_args(settings)
 
+    def test_validate_firmware_interface_update_args_checksum(self):
+        settings = [
+            {
+                "component": "bios",
+                "url": "http://192.168.0.1/bios.exe",
+                "checksum": "a94e683ea16d9ae44768f0a65942234d"
+                            "4cd2a35e9a1d5d89bd9f4be1a39ed6a3"
+            }
+        ]
+        firmware_utils.validate_firmware_interface_update_args(settings)
+
+    def test_validate_firmware_interface_update_args_empty_checksum(self):
+        settings = [
+            {
+                "component": "bios",
+                "url": "http://192.168.0.1/bios.exe",
+                "checksum": ""
+            }
+        ]
+        # The minLength message depends on the jsonschema version.
+        self.assertRaisesRegex(
+            exception.InvalidParameterValue,
+            "is too short|should be non-empty",
+            firmware_utils.validate_firmware_interface_update_args, settings)
+
     def test_validate_firmware_interface_update_args_not_list(self):
         settings = {
             "component": "bios",

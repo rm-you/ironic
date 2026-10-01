@@ -1475,6 +1475,86 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         stage_mock.assert_called_with(node, 'local', '/tmp/test1')
         cleanup_mock.assert_called_with(node)
 
+    @mock.patch.object(firmware_utils, 'verify_checksum', autospec=True)
+    @mock.patch.object(firmware_utils, 'download_to_temp', autospec=True)
+    @mock.patch.object(firmware_utils, 'stage', autospec=True)
+    def test__stage_firmware_file_checksum(self, stage_mock, dwl_tmp_mock,
+                                           verify_mock):
+        CONF.set_override('firmware_source', 'local', 'redfish')
+        firmware_update = {'url': 'https://test1', 'component': 'bmc',
+                           'checksum': 'abc123'}
+        node = mock.Mock()
+        dwl_tmp_mock.return_value = '/tmp/test1'
+        stage_mock.return_value = ('http://staged/test1', 'http')
+
+        firmware = redfish_fw.RedfishFirmware()
+
+        staged_url, needs_cleanup = firmware._stage_firmware_file(
+            node, firmware_update)
+
+        self.assertEqual(staged_url, 'http://staged/test1')
+        self.assertEqual(needs_cleanup, 'http')
+        verify_mock.assert_called_once_with(node, 'abc123', '/tmp/test1')
+        stage_mock.assert_called_once_with(node, 'local', '/tmp/test1')
+
+    @mock.patch.object(firmware_utils, 'cleanup', autospec=True)
+    @mock.patch.object(firmware_utils, 'verify_checksum', autospec=True)
+    @mock.patch.object(firmware_utils, 'download_to_temp', autospec=True)
+    @mock.patch.object(firmware_utils, 'stage', autospec=True)
+    def test__stage_firmware_file_checksum_mismatch(
+            self, stage_mock, dwl_tmp_mock, verify_mock, cleanup_mock):
+        CONF.set_override('firmware_source', 'local', 'redfish')
+        firmware_update = {'url': 'https://test1', 'component': 'bmc',
+                           'checksum': 'abc123'}
+        node = mock.Mock()
+        dwl_tmp_mock.return_value = '/tmp/test1'
+        verify_mock.side_effect = exception.RedfishError(error='mismatch')
+
+        firmware = redfish_fw.RedfishFirmware()
+
+        self.assertRaises(exception.RedfishError,
+                          firmware._stage_firmware_file, node,
+                          firmware_update)
+        verify_mock.assert_called_once_with(node, 'abc123', '/tmp/test1')
+        stage_mock.assert_not_called()
+        cleanup_mock.assert_called_once_with(node)
+
+    @mock.patch.object(firmware_utils, 'verify_checksum', autospec=True)
+    @mock.patch.object(firmware_utils, 'download_to_temp', autospec=True)
+    @mock.patch.object(firmware_utils, 'stage', autospec=True)
+    def test__stage_firmware_file_no_checksum(self, stage_mock,
+                                              dwl_tmp_mock, verify_mock):
+        CONF.set_override('firmware_source', 'local', 'redfish')
+        firmware_update = {'url': 'https://test1', 'component': 'bmc'}
+        node = mock.Mock()
+        dwl_tmp_mock.return_value = '/tmp/test1'
+        stage_mock.return_value = ('http://staged/test1', 'http')
+
+        firmware = redfish_fw.RedfishFirmware()
+        firmware._stage_firmware_file(node, firmware_update)
+
+        verify_mock.assert_not_called()
+        stage_mock.assert_called_once_with(node, 'local', '/tmp/test1')
+
+    @mock.patch.object(firmware_utils, 'verify_checksum', autospec=True)
+    @mock.patch.object(firmware_utils, 'download_to_temp', autospec=True)
+    def test__stage_firmware_file_http_checksum_not_staged(
+            self, dwl_tmp_mock, verify_mock):
+        CONF.set_override('firmware_source', 'http', 'redfish')
+        firmware_update = {'url': 'http://test1', 'component': 'bios',
+                           'checksum': 'abc123'}
+        node = mock.Mock()
+
+        firmware = redfish_fw.RedfishFirmware()
+
+        staged_url, needs_cleanup = firmware._stage_firmware_file(
+            node, firmware_update)
+
+        self.assertEqual(staged_url, 'http://test1')
+        self.assertIsNone(needs_cleanup)
+        dwl_tmp_mock.assert_not_called()
+        verify_mock.assert_not_called()
+
     def _test_continue_updates(self):
 
         update_service_mock = mock.Mock()
