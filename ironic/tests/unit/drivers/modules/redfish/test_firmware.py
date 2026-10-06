@@ -1557,19 +1557,28 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         ]
         log_mock.debug.assert_has_calls(debug_call)
 
+    # NOTE(zigo): cache_firmware_components makes real HTTP calls to the
+    # node's fake BMC address, which may hang for longer than the per-test
+    # 60s SIGALRM timeout in restricted-network build environments
+    # (see Debian bug #1149372).
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
     @mock.patch.object(redfish_fw.RedfishFirmware,
                        '_validate_resources_stability', autospec=True)
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
     @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
                        autospec=True)
     def test_continue_updates_last(self, cond_resume_clean_mock, log_mock,
-                                   validate_mock):
+                                   validate_mock,
+                                   cache_firmware_components_mock):
         self._generate_new_driver_internal_info(['bmc'])
         task = self._test_continue_updates()
 
         cond_resume_clean_mock.assert_called_once_with(task)
         # Verify BMC validation was called before resuming conductor
         validate_mock.assert_called_once()
+        # Verify firmware components were refreshed before resuming conductor
+        cache_firmware_components_mock.assert_called_once()
 
         info_call = [
             mock.call('Firmware updates completed for node %(node)s',
@@ -1577,19 +1586,28 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
         ]
         log_mock.info.assert_has_calls(info_call)
 
+    # NOTE(zigo): cache_firmware_components makes real HTTP calls to the
+    # node's fake BMC address, which may hang for longer than the per-test
+    # 60s SIGALRM timeout in restricted-network build environments
+    # (see Debian bug #1149372).
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
     @mock.patch.object(redfish_fw.RedfishFirmware,
                        '_validate_resources_stability', autospec=True)
     @mock.patch.object(redfish_fw, 'LOG', autospec=True)
     @mock.patch.object(manager_utils, 'notify_conductor_resume_service',
                        autospec=True)
     def test_continue_updates_last_service(self, cond_resume_service_mock,
-                                           log_mock, validate_mock):
+                                           log_mock, validate_mock,
+                                           cache_firmware_components_mock):
         self._generate_new_driver_internal_info_service(['bmc'])
         task = self._test_continue_updates()
 
         cond_resume_service_mock.assert_called_once_with(task)
         # Verify BMC validation was called before resuming conductor
         validate_mock.assert_called_once()
+        # Verify firmware components were refreshed before resuming conductor
+        cache_firmware_components_mock.assert_called_once()
 
         info_call = [
             mock.call('Firmware updates completed for node %(node)s',
@@ -2786,6 +2804,12 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
             mock_continue_updates.assert_called_once()
 
+    # NOTE(zigo): cache_firmware_components makes real HTTP calls to the
+    # node's fake BMC address, which may hang for longer than the per-test
+    # 60s SIGALRM timeout in restricted-network build environments
+    # (see Debian bug #1149372).
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
     @mock.patch.object(redfish_fw.RedfishFirmware,
                        '_validate_resources_stability', autospec=True)
     @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
@@ -2796,7 +2820,8 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     def test_final_update_with_reboot_flag_triggers_reboot(
             self, mock_get_update_service, mock_clear_updates,
-            mock_power_action, mock_resume_clean, validate_mock):
+            mock_power_action, mock_resume_clean, validate_mock,
+            cache_firmware_components_mock):
         """Test final firmware update with reboot flag triggers reboot."""
         settings = [{'component': 'bmc', 'url': 'http://bmc/v1.0.0',
                      'task_monitor': '/tasks/1'}]
@@ -2822,10 +2847,18 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
             # Verify BMC validation was called before resuming conductor
             validate_mock.assert_called_once()
+            # Verify firmware components were refreshed before resuming
+            cache_firmware_components_mock.assert_called_once()
 
             # Verify resume clean was called
             mock_resume_clean.assert_called_once_with(task)
 
+    # NOTE(zigo): cache_firmware_components makes real HTTP calls to the
+    # node's fake BMC address, which may hang for longer than the per-test
+    # 60s SIGALRM timeout in restricted-network build environments
+    # (see Debian bug #1149372).
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
     @mock.patch.object(redfish_fw.RedfishFirmware,
                        '_validate_resources_stability', autospec=True)
     @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
@@ -2836,7 +2869,8 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
     @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
     def test_final_update_without_reboot_flag_no_reboot(
             self, mock_get_update_service, mock_clear_updates,
-            mock_power_action, mock_resume_clean, validate_mock):
+            mock_power_action, mock_resume_clean, validate_mock,
+            cache_firmware_components_mock):
         """Test final firmware update without reboot flag skips reboot."""
         settings = [{'component': 'bmc', 'url': 'http://bmc/v1.0.0',
                      'task_monitor': '/tasks/1'}]
@@ -2861,6 +2895,8 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
             # Verify BMC validation was called before resuming conductor
             validate_mock.assert_called_once()
+            # Verify firmware components were refreshed before resuming
+            cache_firmware_components_mock.assert_called_once()
 
             # Verify resume clean was still called
             mock_resume_clean.assert_called_once_with(task)
