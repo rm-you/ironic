@@ -94,6 +94,11 @@ _FIRMWARE_INTERFACE_UPDATE_SCHEMA = {
                 "description": "bypass BMC update policy for multipart push",
                 "type": "boolean"
             },
+            "version": {
+                "description": "skip BIOS or BMC if this version is installed",
+                "type": "string",
+                "minLength": 1
+            },
             "component": {
                 "description": "name of the firmware component to be updated",
                 "type": "string",
@@ -155,6 +160,10 @@ def validate_firmware_interface_update_args(settings):
                 raise exception.InvalidParameterValue(
                     _('oem_parameters and force_update require '
                       'method multipart.'))
+            if ('version' in update
+                    and update['component'] not in ('bios', 'bmc')):
+                raise exception.InvalidParameterValue(
+                    _('version is supported for BIOS and BMC only.'))
     except jsonschema.ValidationError as err:
         raise exception.InvalidParameterValue(
             _('Invalid firmware update %(settings)s. Errors: %(err)s')

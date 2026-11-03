@@ -1,0 +1,6 @@
+---
+features:
+  - |
+    Redfish BIOS and BMC firmware images accept an optional ``version`` to
+    skip an update if that exact version is already installed. Version strings
+    are compared only for equality; older requested versions are not rejected.
