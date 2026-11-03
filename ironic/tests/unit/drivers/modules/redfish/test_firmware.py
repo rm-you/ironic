@@ -4549,3 +4549,37 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
         resume_mock.assert_called_once()
         self.mocks['clean_error'].assert_not_called()
         self.assertNotIn(redfish_fw.FW_UPDATE, self.node.driver_internal_info)
+
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_multipart_update',
+                       autospec=True)
+    def test_grouping_dispatches_each_image_transport(self, push_mock,
+                                                      collection_mock):
+        collection_mock.return_value.members_identities = ['/Systems/1']
+        update_service = self._submits('nic1')
+        tasks = self._fake_tasks()
+
+        def upload(interface, node, service, update):
+            name = 'bios' if update['component'] == 'bios' else 'nic2'
+            update['task_monitor'] = '/tasks/' + name
+            update['power_timeout'] = 300
+
+        push_mock.side_effect = upload
+        settings = [
+            {'component': 'bios', 'url': 'http://fw/bios.bin',
+             'method': 'multipart'},
+            {'component': 'nic:NIC.1', 'url': 'http://fw/nic1.bin'},
+            {'component': 'nic:NIC.2', 'url': 'http://fw/nic2.bin',
+             'method': 'multipart'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.firmware.update(task, settings, allow_grouping_reboots=True)
+        self.node.refresh()
+        for name in ('bios', 'nic1', 'nic2'):
+            tasks['/tasks/' + name] = sushy.TASK_STATE_COMPLETED
+            self._poll()
+        self.assertEqual(2, push_mock.call_count)
+        update_service.simple_update.assert_called_once_with(
+            'http://fw/nic1.bin')
+        self.assertEqual(1, self.mocks['power'].call_count)
+        self.mocks['clean_error'].assert_not_called()
