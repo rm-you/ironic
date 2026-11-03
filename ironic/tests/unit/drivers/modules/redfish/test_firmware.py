@@ -13,10 +13,13 @@
 
 import datetime
 import functools
+import hashlib
 import json
+import os
 import time
 from unittest import mock
 
+import fixtures
 from oslo_config import cfg
 from oslo_utils import timeutils
 import sushy
@@ -2612,6 +2615,128 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             # Verify resume clean was still called
             mock_resume_clean.assert_called_once_with(task)
 
+    def _multipart_settings(self):
+        return {'component': 'bmc', 'url': 'https://images.example/bmc.bin',
+                'method': 'multipart', 'checksum': 'a' * 64,
+                'targets': ['/inventory/BMCImage1'],
+                'oem_parameters': {'ImageType': 'BMC'}}
+
+    def _download(self, node, url, temp_dir=None):
+        self.downloaded = os.path.join(temp_dir, 'firmware.bin')
+        with open(self.downloaded, 'wb') as f:
+            f.write(b'firmware')
+        return self.downloaded
+
+    @mock.patch.object(firmware_utils, 'cleanup', autospec=True)
+    @mock.patch.object(firmware_utils, 'verify_checksum', autospec=True)
+    @mock.patch.object(firmware_utils, 'download_to_temp', autospec=True)
+    def test__submit_multipart_update(self, download_mock, verify_mock,
+                                      cleanup_mock):
+        download_mock.side_effect = self._download
+        update_service = mock.Mock()
+        update_service.multipart_update.return_value.task_monitor_uri = (
+            '/task/1')
+        calls = mock.Mock()
+        calls.attach_mock(download_mock, 'download')
+        calls.attach_mock(verify_mock, 'verify')
+        calls.attach_mock(update_service.multipart_update, 'push')
+        fw_upd = self._multipart_settings()
+        redfish_fw.RedfishFirmware()._submit_multipart_update(
+            self.node, update_service, fw_upd)
+        self.assertEqual(['download', 'verify', 'push'],
+                         [call[0] for call in calls.mock_calls])
+        update_service.multipart_update.assert_called_once_with(
+            self.downloaded, targets=['/inventory/BMCImage1'],
+            oem_parameters={'ImageType': 'BMC'}, force_update=None)
+        self.assertEqual('/task/1', fw_upd['task_monitor'])
+        self.assertFalse(os.path.exists(os.path.dirname(self.downloaded)))
+        cleanup_mock.assert_not_called()
+
+    @mock.patch.object(firmware_utils, 'verify_checksum', autospec=True)
+    @mock.patch.object(firmware_utils, 'download_to_temp', autospec=True)
+    def test__submit_multipart_update_checksum_failure(self, download_mock,
+                                                       verify_mock):
+        download_mock.side_effect = self._download
+        verify_mock.side_effect = exception.RedfishError(
+            error='checksum mismatch')
+        update_service = mock.Mock()
+        firmware_interface = redfish_fw.RedfishFirmware()
+        self.assertRaises(exception.RedfishError,
+                          firmware_interface._submit_multipart_update,
+                          self.node, update_service,
+                          self._multipart_settings())
+        update_service.multipart_update.assert_not_called()
+        self.assertFalse(os.path.exists(os.path.dirname(self.downloaded)))
+
+    @mock.patch.object(firmware_utils, 'download_to_temp', autospec=True)
+    def test__submit_multipart_update_push_failure(self, download_mock):
+        download_mock.side_effect = self._download
+        update_service = mock.Mock()
+        update_service.multipart_update.side_effect = (
+            sushy.exceptions.ConnectionError(url='/upload',
+                                             error='connection lost'))
+        fw_upd = self._multipart_settings()
+        del fw_upd['checksum']
+        firmware_interface = redfish_fw.RedfishFirmware()
+        self.assertRaises(exception.RedfishError,
+                          firmware_interface._submit_multipart_update,
+                          self.node, update_service, fw_upd)
+        self.assertFalse(os.path.exists(os.path.dirname(self.downloaded)))
+
+    @mock.patch.object(firmware_utils, 'download_to_temp', autospec=True)
+    def test__submit_multipart_update_download_failure(self, download_mock):
+        def fail(*args, **kwargs):
+            self._download(*args, **kwargs)
+            raise exception.RedfishError(error='download failed')
+
+        download_mock.side_effect = fail
+        update_service = mock.Mock()
+        firmware_interface = redfish_fw.RedfishFirmware()
+        self.assertRaises(exception.RedfishError,
+                          firmware_interface._submit_multipart_update,
+                          self.node, update_service,
+                          self._multipart_settings())
+        update_service.multipart_update.assert_not_called()
+        self.assertFalse(os.path.exists(os.path.dirname(self.downloaded)))
+
+    @mock.patch.object(firmware_utils, 'image_service', autospec=True)
+    def test__submit_multipart_update_keeps_staged_image(self,
+                                                         image_service_mock):
+        root = self.useFixture(fixtures.TempDir()).path
+        self.config(http_root=os.path.join(root, 'http'),
+                    http_url='http://conductor.example/', group='deploy')
+        previous = os.path.join(root, 'firmware.bin')
+        with open(previous, 'wb') as f:
+            f.write(b'previous image')
+        staged_url, cleanup = firmware_utils.stage(
+            self.node, 'local', previous)
+        self.node.set_driver_internal_info('firmware_cleanup', [cleanup])
+        staged = os.path.join(root, 'http', 'firmware', self.node.uuid,
+                              'firmware.bin')
+        download = image_service_mock.HttpImageService.return_value.download
+        download.side_effect = lambda url, file: file.write(b'new image')
+        fw_upd = self._multipart_settings()
+        fw_upd['url'] = 'https://images.example/firmware.bin'
+        fw_upd['checksum'] = hashlib.sha256(b'new image').hexdigest()
+        redfish_fw.RedfishFirmware()._submit_multipart_update(
+            self.node, mock.Mock(), fw_upd)
+        for path in (staged, previous):
+            with open(path, 'rb') as f:
+                self.assertEqual(b'previous image', f.read())
+        self.assertIn(self.node.uuid, staged_url)
+        self.assertEqual([cleanup],
+                         self.node.driver_internal_info['firmware_cleanup'])
+
+    @mock.patch.object(firmware_utils, 'download_to_temp', autospec=True)
+    def test__submit_multipart_update_no_push_uri(self, download_mock):
+        update_service = mock.Mock(multipart_http_push_uri=None)
+        firmware_interface = redfish_fw.RedfishFirmware()
+        self.assertRaisesRegex(exception.RedfishError, 'MultipartHttpPushUri',
+                               firmware_interface._submit_multipart_update,
+                               self.node, update_service,
+                               self._multipart_settings())
+        download_mock.assert_not_called()
+
 
 @mock.patch.object(redfish_utils, 'get_system', autospec=True)
 class RedfishFirmwareVerifyTestCase(db_base.DbTestCase):
@@ -4765,3 +4890,37 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
         resume_mock.assert_called_once()
         self.mocks['clean_error'].assert_not_called()
         self.assertNotIn(redfish_fw.FW_UPDATE, self.node.driver_internal_info)
+
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_multipart_update',
+                       autospec=True)
+    def test_grouping_dispatches_each_image_transport(self, push_mock,
+                                                      collection_mock):
+        collection_mock.return_value.members_identities = ['/Systems/1']
+        update_service = self._submits('nic1')
+        tasks = self._fake_tasks()
+
+        def upload(interface, node, service, update):
+            name = 'bios' if update['component'] == 'bios' else 'nic2'
+            update['task_monitor'] = '/tasks/' + name
+            update['power_timeout'] = 300
+
+        push_mock.side_effect = upload
+        settings = [
+            {'component': 'bios', 'url': 'http://fw/bios.bin',
+             'method': 'multipart'},
+            {'component': 'nic:NIC.1', 'url': 'http://fw/nic1.bin'},
+            {'component': 'nic:NIC.2', 'url': 'http://fw/nic2.bin',
+             'method': 'multipart'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.firmware.update(task, settings, allow_grouping_reboots=True)
+        self.node.refresh()
+        for name in ('bios', 'nic1', 'nic2'):
+            tasks['/tasks/' + name] = sushy.TASK_STATE_COMPLETED
+            self._poll()
+        self.assertEqual(2, push_mock.call_count)
+        update_service.simple_update.assert_called_once_with(
+            'http://fw/nic1.bin')
+        self.assertEqual(1, self.mocks['power'].call_count)
+        self.mocks['clean_error'].assert_not_called()

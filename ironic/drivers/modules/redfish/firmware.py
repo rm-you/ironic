@@ -12,6 +12,7 @@
 #    under the License.
 
 import datetime
+import tempfile
 import time
 from urllib.parse import urlparse
 
@@ -610,6 +611,37 @@ class RedfishFirmware(base.FirmwareInterface):
                   'Will check again in %(interval)s seconds.',
                   {'node': node.uuid, 'interval': wait_interval})
 
+    def _submit_firmware_update(self, node, update_service, fw_upd):
+        """Submit one image through its selected transport."""
+        if fw_upd.get('method') == 'multipart':
+            self._submit_multipart_update(node, update_service, fw_upd)
+        else:
+            self._submit_simple_update(node, update_service, fw_upd)
+
+    def _submit_multipart_update(self, node, update_service, fw_upd):
+        """Download, verify and push an image, then reuse task polling."""
+        if not update_service.multipart_http_push_uri:
+            raise exception.RedfishError(
+                error=_('BMC does not advertise MultipartHttpPushUri.'))
+        try:
+            # A group may still need images staged for SimpleUpdate. Own only
+            # this download, including when another image has the same name.
+            with tempfile.TemporaryDirectory(prefix='ironic-firmware-') as tmp:
+                filename = firmware_utils.download_to_temp(
+                    node, fw_upd['url'], temp_dir=tmp)
+                if fw_upd.get('checksum'):
+                    firmware_utils.verify_checksum(node, fw_upd['checksum'],
+                                                   filename)
+                monitor = update_service.multipart_update(
+                    filename, targets=fw_upd.get('targets'),
+                    oem_parameters=fw_upd.get('oem_parameters'),
+                    force_update=fw_upd.get('force_update'))
+                fw_upd['task_monitor'] = monitor.task_monitor_uri
+                fw_upd['power_timeout'] = (
+                    CONF.redfish.firmware_update_reboot_delay)
+        except sushy.exceptions.SushyError as error:
+            raise exception.RedfishError(error=error)
+
     def _submit_simple_update(self, node, update_service, fw_upd):
         """Submit a SimpleUpdate request and track cleanup.
 
@@ -636,7 +668,9 @@ class RedfishFirmware(base.FirmwareInterface):
         # we need to explicitly specify Target parameter when calling
         # SimpleUpdate. This is needed for compatibility with sushy-tools
         # in automated testing using VMs.
-        if count > 1:
+        if 'targets' in fw_upd:
+            targets = fw_upd['targets']
+        elif count > 1:
             target = node.driver_info.get('redfish_system_id')
             targets = [target]
         else:
@@ -690,7 +724,7 @@ class RedfishFirmware(base.FirmwareInterface):
             to be executed.
         """
         fw_upd = settings[0]
-        self._submit_simple_update(node, update_service, fw_upd)
+        self._submit_firmware_update(node, update_service, fw_upd)
         self._set_updates(node, settings)
 
         component_type = redfish_utils.get_component_type(
@@ -1098,8 +1132,8 @@ class RedfishFirmware(base.FirmwareInterface):
             # instead of submitting the next update a second time.
             self._save_updates(node, settings)
             try:
-                self._submit_simple_update(node, update_service,
-                                           settings[nxt])
+                self._submit_firmware_update(node, update_service,
+                                             settings[nxt])
             except exception.IronicException as e:
                 self._fail(task, _(
                     'Failed to submit %(component)s firmware for node '

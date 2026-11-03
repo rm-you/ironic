@@ -1,0 +1,9 @@
+---
+features:
+  - |
+    Redfish firmware updates can now push the image to the BMC from the
+    conductor, for BMCs that need the image pushed to them rather than
+    downloading it themselves. Set ``method`` to ``multipart`` on the image
+    to use this. Multipart images can also set ``oem_parameters``, passed to
+    the BMC unchanged, and ``force_update``. Any image can set ``targets`` to
+    choose the Redfish resources to update.

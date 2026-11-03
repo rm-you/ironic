@@ -114,6 +114,8 @@ and the checksum is not verified.
 For ``url`` currently ``http``, ``https``, ``swift`` and ``file`` schemes are
 supported.
 
+Images can also set ``method``; see `Multipart firmware push`_.
+
 Batched updates (consolidated reboot)
 --------------------------------------
 
@@ -328,6 +330,54 @@ In the following example, the JSON is specified directly on the command line:
    For HPE machines you must extract the ilo5_<version>.bin from the
    ilo5_<version>.fwpkg
    This can be done using the command ``7za e ilo<version>.fwpkg``.
+
+Multipart firmware push
+-----------------------
+
+By default, the BMC downloads each image from its ``url`` itself
+(``method: simple``, the Redfish ``SimpleUpdate`` action). Some BMCs need
+the image pushed to them instead. With ``method: multipart``, the conductor
+downloads the image, checks its ``checksum`` if one is given, and uploads
+it to the BMC's ``MultipartHttpPushUri``. The downloaded file is deleted
+afterwards. A failed multipart upload is not retried with ``simple``, and
+``firmware_source`` has no effect on multipart images.
+
+The ``checksum`` is optional and ``http`` URLs are allowed. To make sure the
+image is not changed on its way to the conductor, use ``https`` or give a
+SHA-256 or SHA-512 checksum.
+
+The conductor waits up to ``[redfish]read_timeout`` seconds for the BMC to
+answer the upload. Some BMCs check the image before they answer, so you may
+need to raise this option. It applies to every Redfish request, not just
+uploads. If the BMC does not answer in time, the step fails. The image is
+not sent again, because the BMC may already have it.
+
+Multipart images accept two more keys:
+
+* ``oem_parameters``: a JSON object passed to the BMC unchanged.
+* ``force_update``: asks the BMC to override its update policy. Whether
+  this works depends on the BMC.
+
+``targets``, a list of Redfish resource URIs, works with both methods. It
+replaces the targets Ironic would otherwise pick.
+
+For example, a BMC that needs an ``ImageType`` OEM parameter might use::
+
+    [{"interface": "firmware", "step": "update", "args": {"settings": [
+      {"component": "bmc", "method": "multipart",
+       "url": "https://images.example/bmc.bin",
+       "checksum": "<SHA-256 digest>",
+       "targets": ["/redfish/v1/UpdateService/FirmwareInventory/BMC"],
+       "oem_parameters": {"ImageType": "BMC"}}
+    ]}}]
+
+For BIOS, use the BIOS image, ``component: bios``, a target such as
+``/redfish/v1/UpdateService/FirmwareInventory/BIOS``, and
+``oem_parameters: {"ImageType": "BIOS"}``. Check the target and OEM values
+for your hardware model. A reboot of the host applies BIOS updates.
+
+With ``allow_grouping_reboots``, multipart and simple images can share a
+reboot, each using its own method.
 
 How it works - via Management Interface
 ---------------------------------------

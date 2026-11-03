@@ -609,3 +609,45 @@ class FirmwareUtilsTestCase(base.TestCase):
             exception.InvalidParameterValue,
             "'NICX1' is not valid under any of the given schemas",
             firmware_utils.validate_firmware_interface_update_args, settings3)
+
+    def test_validate_firmware_interface_update_args_multipart(self):
+        settings = [
+            {
+                "component": "bmc",
+                "url": "https://192.168.0.1/bmc.bin",
+                "method": "multipart",
+                "targets": ["/redfish/v1/UpdateService/FirmwareInventory/BMC"],
+                "oem_parameters": {"ImageType": "BMC"},
+                "force_update": True
+            }
+        ]
+        firmware_utils.validate_firmware_interface_update_args(settings)
+
+    def test_validate_firmware_interface_update_args_invalid_method(self):
+        settings = [{"component": "bmc", "url": "https://192.168.0.1/bmc.bin",
+                     "method": "automatic"}]
+        self.assertRaisesRegex(
+            exception.InvalidParameterValue, "'automatic' is not one of",
+            firmware_utils.validate_firmware_interface_update_args, settings)
+
+    def test_validate_firmware_interface_update_args_invalid_targets(self):
+        settings = [{"component": "bmc", "url": "https://192.168.0.1/bmc.bin",
+                     "method": "multipart", "targets": "BMC"}]
+        self.assertRaisesRegex(
+            exception.InvalidParameterValue, "'BMC' is not of type 'array'",
+            firmware_utils.validate_firmware_interface_update_args, settings)
+
+    def test_validate_firmware_interface_update_args_invalid_oem(self):
+        settings = [{"component": "bmc", "url": "https://192.168.0.1/bmc.bin",
+                     "method": "multipart", "oem_parameters": "BMC"}]
+        self.assertRaisesRegex(
+            exception.InvalidParameterValue, "'BMC' is not of type 'object'",
+            firmware_utils.validate_firmware_interface_update_args, settings)
+
+    def test_validate_firmware_interface_update_args_oem_needs_multipart(self):
+        settings = [{"component": "bmc", "url": "https://192.168.0.1/bmc.bin",
+                     "oem_parameters": {"ImageType": "BMC"}}]
+        self.assertRaisesRegex(
+            exception.InvalidParameterValue,
+            "Component bmc sets oem_parameters or force_update",
+            firmware_utils.validate_firmware_interface_update_args, settings)
