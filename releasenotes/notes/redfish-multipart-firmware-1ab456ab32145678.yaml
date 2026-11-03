@@ -1,0 +1,7 @@
+---
+features:
+  - |
+    The Redfish ``firmware.update`` step accepts ``method: multipart`` to
+    download, optionally verify and push firmware from the conductor, with
+    explicit target URIs and opaque OEM JSON parameters. ``force_update``
+    can request a BMC policy override; it is omitted by default.
