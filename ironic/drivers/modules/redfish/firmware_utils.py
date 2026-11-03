@@ -94,6 +94,11 @@ _FIRMWARE_INTERFACE_UPDATE_SCHEMA = {
                 "description": "bypass BMC update policy for multipart push",
                 "type": "boolean"
             },
+            "version": {
+                "description": "skip BIOS or BMC if this version is installed",
+                "type": "string",
+                "minLength": 1
+            },
             "component": {
                 "description": "name of the firmware component to be updated",
                 "type": "string",
@@ -160,6 +165,11 @@ def validate_firmware_interface_update_args(settings):
             raise exception.InvalidParameterValue(
                 _('Component %s sets oem_parameters or force_update, which '
                   'are only supported with method multipart.') % component)
+        if ('version' in update
+                and component not in redfish_utils.FIRMWARE_COMPONENTS):
+            raise exception.InvalidParameterValue(
+                _('Component %s sets a version, which is only supported for '
+                  'the BIOS and the BMC.') % component)
 
 
 def get_swift_temp_url(parsed_url):

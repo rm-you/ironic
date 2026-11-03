@@ -114,7 +114,8 @@ and the checksum is not verified.
 For ``url`` currently ``http``, ``https``, ``swift`` and ``file`` schemes are
 supported.
 
-Images can also set ``method``; see `Multipart firmware push`_.
+Images can also set ``method`` (see `Multipart firmware push`_) and, for
+BIOS and BMC, ``version`` (see `Version skipping`_).
 
 Batched updates (consolidated reboot)
 --------------------------------------
@@ -378,6 +379,18 @@ for your hardware model. A reboot of the host applies BIOS updates.
 
 With ``allow_grouping_reboots``, multipart and simple images can share a
 reboot, each using its own method.
+
+Version skipping
+----------------
+
+BIOS and BMC images can set ``version``. Just before Ironic submits such an
+image, it reads the installed version, and skips the image if it is exactly
+the same. Versions are compared as plain strings, not as numbers, so you
+can also install an older version. Other components do not accept
+``version``.
+
+With ``allow_grouping_reboots``, this check also runs just before each
+later image in the group is staged.
 
 How it works - via Management Interface
 ---------------------------------------

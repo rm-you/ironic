@@ -1,0 +1,6 @@
+---
+features:
+  - |
+    Redfish BIOS and BMC firmware images can now set ``version``. If that
+    exact version is already installed, the image is skipped. Versions are
+    compared as plain strings, so an older version can still be installed.
