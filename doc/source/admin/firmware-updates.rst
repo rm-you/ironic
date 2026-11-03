@@ -381,6 +381,18 @@ including later members of a group. Multipart downloads use a private
 directory and are removed after the upload; files staged for other images
 remain available until normal step cleanup.
 
+Version skipping
+~~~~~~~~~~~~~~~~
+
+BIOS and BMC images accept an optional ``version`` string. Each image is
+checked immediately before submission and skipped if its installed version
+exactly matches. Version strings are opaque and are not ordered, so
+downgrades are permitted. Other component types do not accept ``version``.
+
+With reboot grouping, the check also runs immediately before each later
+member is staged. A BMC entry still ends the staging group; its installed
+version is checked after the preceding group has been applied.
+
 How it works - via Management Interface
 ---------------------------------------
 

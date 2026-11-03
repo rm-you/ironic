@@ -399,6 +399,9 @@ class RedfishFirmware(base.FirmwareInterface):
         if allow_grouping_reboots:
             self._validate_grouping(settings)
         node = task.node
+        self._skip_matching_updates(node, settings)
+        if not settings:
+            return
         update_service = redfish_utils.get_update_service(node)
 
         LOG.debug('Updating Firmware on node %(node_uuid)s with settings '
@@ -697,6 +700,40 @@ class RedfishFirmware(base.FirmwareInterface):
             self._submit_multipart_update(node, update_service, fw_upd)
         else:
             self._submit_simple_update(node, update_service, fw_upd)
+
+    def _skip_matching_updates(self, node, settings,
+                               stop_at_bmc=False):
+        """Skip matching versions immediately before submitting each update."""
+        while settings and settings[0].get('version') is not None:
+            update = settings[0]
+            component = update['component']
+            # A BMC entry ends a staging group. Check it only once the
+            # preceding group has been applied, immediately before submission.
+            if stop_at_bmc and component == redfish_utils.BMC:
+                break
+            if component == redfish_utils.BIOS:
+                resource = redfish_utils.get_system(node)
+                resource.refresh(force=True)
+                installed = resource.bios_version
+            elif component == redfish_utils.BMC:
+                resource = redfish_utils.get_manager(
+                    node, redfish_utils.get_system(node))
+                resource.refresh(force=True)
+                installed = resource.firmware_version
+            else:
+                raise exception.InvalidParameterValue(
+                    _('Firmware version skipping is supported for BIOS '
+                      'and BMC components only.'))
+            # Version strings are opaque. In particular, an older requested
+            # version is allowed and never compared numerically.
+            if installed != update['version']:
+                break
+            LOG.info('Skipping %(component)s firmware update on '
+                     'node %(node)s: '
+                     'version %(version)s is already installed.',
+                     {'component': component, 'node': node.uuid,
+                      'version': installed})
+            settings.pop(0)
 
     def _submit_multipart_update(self, node, update_service, fw_upd):
         """Download, verify and push an image, then reuse task polling."""
@@ -1019,6 +1056,16 @@ class RedfishFirmware(base.FirmwareInterface):
             return
 
         count = self._applying_count(settings)
+        remaining = settings[count:]
+        try:
+            self._skip_matching_updates(node, remaining)
+        except (exception.RedfishError, sushy.exceptions.SushyError) as e:
+            # Nothing has been saved, so the next poll checks again.
+            LOG.warning('Unable to read the installed firmware version of '
+                        'node %(node)s. Will try again on the next poll. '
+                        'Error: %(error)s', {'node': node.uuid, 'error': e})
+            return
+        settings[count:] = remaining
         if len(settings) == count:
             self._clear_updates(node)
 
@@ -1299,6 +1346,21 @@ class RedfishFirmware(base.FirmwareInterface):
         settings[idx].pop(STARTING_SINCE, None)
         self._set_phase(node, settings[idx], PHASE_STAGED)
         nxt = idx + 1
+        if node.driver_internal_info[FW_UPDATE]['grouping']:
+            remaining = settings[nxt:]
+            try:
+                self._skip_matching_updates(node, remaining,
+                                            stop_at_bmc=True)
+            except (exception.RedfishError,
+                    sushy.exceptions.SushyError) as e:
+                # Nothing has been saved, so the next poll reads the task
+                # again and checks again.
+                LOG.warning('Unable to read the installed firmware version '
+                            'of node %(node)s. Will try again on the next '
+                            'poll. Error: %(error)s',
+                            {'node': node.uuid, 'error': e})
+                return
+            settings[nxt:] = remaining
         if (node.driver_internal_info[FW_UPDATE]['grouping']
                 and nxt < len(settings)
                 and redfish_utils.get_component_type(
