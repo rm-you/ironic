@@ -4580,3 +4580,102 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
             'http://fw/nic1.bin')
         self.assertEqual(1, self.mocks['power'].call_count)
         self.mocks['clean_error'].assert_not_called()
+
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    def test_grouping_skips_matching_version_before_later_submission(
+            self, collection_mock):
+        collection_mock.return_value.members_identities = ['/Systems/1']
+        update_service = self._submits('nic1', 'nic2')
+        tasks = self._fake_tasks()
+        settings = [
+            {'component': 'nic:NIC.1', 'url': 'http://fw/nic1.bin'},
+            {'component': 'bios', 'url': 'http://fw/bios.bin',
+             'version': '2.0'},
+            {'component': 'nic:NIC.2', 'url': 'http://fw/nic2.bin'}]
+        self.mocks['system'].return_value.bios_version = '1.0'
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.firmware.update(task, settings, allow_grouping_reboots=True)
+        self.node.refresh()
+        self.mocks['system'].return_value.bios_version = '2.0'
+        tasks['/tasks/nic1'] = sushy.TASK_STATE_COMPLETED
+        self._poll()
+        self.assertEqual([mock.call('http://fw/nic1.bin'),
+                          mock.call('http://fw/nic2.bin')],
+                         update_service.simple_update.call_args_list)
+        self.assertEqual(['nic:NIC.1', 'nic:NIC.2'],
+                         [u['component'] for u in self._updates()])
+
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
+    def test_grouping_does_not_check_bmc_version_before_group_applied(
+            self, manager_mock, collection_mock):
+        collection_mock.return_value.members_identities = ['/Systems/1']
+        update_service = self._submits('nic1')
+        tasks = self._fake_tasks()
+        settings = [
+            {'component': 'nic:NIC.1', 'url': 'http://fw/nic1.bin'},
+            {'component': 'bmc', 'url': 'http://fw/bmc.bin',
+             'version': '2.0'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.firmware.update(task, settings, allow_grouping_reboots=True)
+        self.node.refresh()
+        tasks['/tasks/nic1'] = sushy.TASK_STATE_COMPLETED
+        self._poll()
+        manager_mock.assert_not_called()
+        self.assertEqual(1, update_service.simple_update.call_count)
+        self.assertEqual(1, self.mocks['power'].call_count)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    def test_version_read_error_retries_on_next_poll(self, resume_mock,
+                                                     cache_mock):
+        nic = self._update('nic:NIC.1', phase=redfish_fw.PHASE_WAITING,
+                           wait=1, wait_start_time=self.now.isoformat())
+        bios = {'component': 'bios', 'url': 'http://fw/bios.bin',
+                'version': '2.0'}
+        self._set_updates(nic, bios)
+        self._advance(10)
+        self.mocks['system'].side_effect = exception.RedfishConnectionError(
+            node=self.node.uuid, error='BMC busy')
+        self._poll()
+        self._assert_waiting(redfish_fw.PHASE_WAITING)
+        self.assertEqual(['nic:NIC.1', 'bios'],
+                         [u['component'] for u in self._updates()])
+        resume_mock.assert_not_called()
+        # The next poll reads the version and skips the installed BIOS.
+        self.mocks['system'].side_effect = None
+        self.mocks['system'].return_value.bios_version = '2.0'
+        self._poll()
+        self.assertIsNone(self._updates())
+        resume_mock.assert_called_once()
+        self.mocks['clean_error'].assert_not_called()
+
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    def test_grouping_version_read_error_retries_on_next_poll(
+            self, collection_mock):
+        collection_mock.return_value.members_identities = ['/Systems/1']
+        update_service = self._submits('bios')
+        tasks = self._fake_tasks()
+        tasks['/tasks/nic1'] = sushy.TASK_STATE_COMPLETED
+        nic = self._update('nic:NIC.1', task_monitor='/tasks/nic1')
+        bios = {'component': 'bios', 'url': 'http://fw/bios.bin',
+                'version': '2.0'}
+        self._set_updates(nic, bios, grouping=True)
+        self.mocks['system'].side_effect = exception.RedfishConnectionError(
+            node=self.node.uuid, error='BMC busy')
+        self._poll()
+        self._assert_waiting(redfish_fw.PHASE_STAGING)
+        update_service.simple_update.assert_not_called()
+        # The next poll reads the version and stages the BIOS update.
+        self.mocks['system'].side_effect = None
+        self.mocks['system'].return_value.bios_version = '1.0'
+        self._poll()
+        update_service.simple_update.assert_called_once_with(
+            'http://fw/bios.bin')
+        self.assertEqual([redfish_fw.PHASE_STAGED, redfish_fw.PHASE_STAGING],
+                         [u['phase'] for u in self._updates()])
+        self.mocks['clean_error'].assert_not_called()

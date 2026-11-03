@@ -22,6 +22,7 @@ import sushy
 from ironic.common import exception
 from ironic.drivers.modules.redfish import firmware
 from ironic.drivers.modules.redfish import firmware_utils
+from ironic.drivers.modules.redfish import utils
 from ironic.tests import base
 
 
@@ -137,6 +138,28 @@ class MultipartFirmwareTestCase(base.TestCase):
             self.interface._submit_multipart_update,
             self.node, self.service, self.update)
         download.assert_not_called()
+
+    @mock.patch.object(utils, 'get_manager', autospec=True)
+    @mock.patch.object(utils, 'get_system', autospec=True)
+    def test_version_skip_and_downgrade(self, system, manager):
+        system.return_value.bios_version = '2.0'
+        manager.return_value.firmware_version = '3.0'
+        settings = [{'component': 'bios', 'version': '2.0'},
+                    {'component': 'bmc', 'version': '3.0'},
+                    {'component': 'bios', 'version': '1.0'}]
+        self.interface._skip_matching_updates(self.node, settings)
+        self.assertEqual([{'component': 'bios', 'version': '1.0'}], settings)
+
+    @mock.patch.object(utils, 'get_system', autospec=True)
+    @mock.patch.object(utils, 'get_update_service', autospec=True)
+    def test_all_skipped_completes_without_submission(
+            self, update_service, system):
+        system.return_value.bios_version = '1.0'
+        task = mock.Mock(node=self.node)
+        self.assertIsNone(self.interface.update(
+            task, [{'component': 'bios', 'url': 'https://example/bios.bin',
+                    'version': '1.0'}]))
+        update_service.assert_not_called()
 
     def test_schema_multipart_parameters(self):
         firmware_utils.validate_firmware_interface_update_args([self.update])
