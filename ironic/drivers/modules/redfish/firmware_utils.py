@@ -75,6 +75,25 @@ _FIRMWARE_INTERFACE_UPDATE_SCHEMA = {
         "type": "object",
         "required": ["component", "url"],
         "properties": {
+            "method": {
+                "description": "firmware transfer method (default simple)",
+                "type": "string",
+                "enum": ["simple", "multipart"]
+            },
+            "targets": {
+                "description": "explicit Redfish target resource URIs",
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string", "minLength": 1}
+            },
+            "oem_parameters": {
+                "description": "opaque multipart OEM JSON parameters",
+                "type": "object"
+            },
+            "force_update": {
+                "description": "bypass BMC update policy for multipart push",
+                "type": "boolean"
+            },
             "component": {
                 "description": "name of the firmware component to be updated",
                 "type": "string",
@@ -129,6 +148,13 @@ def validate_firmware_interface_update_args(settings):
     """
     try:
         jsonschema.validate(settings, _FIRMWARE_INTERFACE_UPDATE_SCHEMA)
+        for update in settings:
+            multipart = update.get('method', 'simple') == 'multipart'
+            if not multipart and any(key in update for key in
+                                     ('oem_parameters', 'force_update')):
+                raise exception.InvalidParameterValue(
+                    _('oem_parameters and force_update require '
+                      'method multipart.'))
     except jsonschema.ValidationError as err:
         raise exception.InvalidParameterValue(
             _('Invalid firmware update %(settings)s. Errors: %(err)s')
@@ -147,11 +173,12 @@ def get_swift_temp_url(parsed_url):
         CONF.redfish.swift_object_expiry_timeout)
 
 
-def download_to_temp(node, url):
+def download_to_temp(node, url, temp_dir=None):
     """Downloads to temporary location from given URL
 
     :param node: Node for which to download to temporary location
     :param url: URL to download from
+    :param temp_dir: optional caller-owned download directory
     :returns: File path of temporary location file is downloaded to
     """
     parsed_url = urlparse.urlparse(url)
@@ -161,7 +188,7 @@ def download_to_temp(node, url):
             _('%(scheme)s is not supported for %(url)s.')
             % {'scheme': scheme, 'url': parsed_url.geturl()})
 
-    tempdir = os.path.join(tempfile.gettempdir(), node.uuid)
+    tempdir = temp_dir or os.path.join(tempfile.gettempdir(), node.uuid)
     os.makedirs(tempdir, exist_ok=True)
     temp_file = os.path.join(
         tempdir,
