@@ -536,3 +536,24 @@ downgrades are permitted. Other component types do not accept ``version``.
 With reboot grouping, the check also runs immediately before each later
 member is staged. A BMC entry still ends the staging group; its installed
 version is checked after the preceding group has been applied.
+
+Version confirmation
+--------------------
+
+A BIOS image with ``version`` must report that exact version after the
+reboot that applies it. Once the task, the boot and any Dell Lifecycle
+Controller jobs have been checked, the System has
+``[redfish]firmware_update_reboot_delay`` seconds to report it, checked on
+each status poll; otherwise the step fails.
+
+A BMC image with ``version`` must report that exact version after its task
+finishes or disappears. A different version, even if changed, keeps polling;
+failure to match before the completion deadline fails the step. Without a
+requested version, the existing version-change, same-version no-op and
+unreadable-BMC reboot handling remain in effect.
+
+The baseline version is read before either transport submits the image.
+Per-image ``wait`` delays the first task check. Once the task has finished
+or disappeared, the BMC has ``[redfish]firmware_update_reboot_delay``
+seconds to report the requested version, checked every
+``[redfish]firmware_update_bmc_version_check_interval`` seconds.

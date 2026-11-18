@@ -1,0 +1,15 @@
+---
+features:
+  - |
+    Redfish BMC firmware updates with an optional requested ``version``
+    require that exact version after task completion or disappearance,
+    failing if it is not observed within
+    ``[redfish]firmware_update_reboot_delay`` seconds after the task ends.
+    The baseline version is captured before submitting either a SimpleUpdate
+    or multipart request.
+  - |
+    Redfish BIOS firmware updates with an optional requested ``version``
+    require that exact version after the reboot that applies them, failing
+    if the System does not report it within
+    ``[redfish]firmware_update_reboot_delay`` seconds of the other checks
+    after the reboot passing.
