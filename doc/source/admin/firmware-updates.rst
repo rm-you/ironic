@@ -377,6 +377,17 @@ For BIOS, use the BIOS image, ``component: bios``, a target such as
 ``oem_parameters: {"ImageType": "BIOS"}``. Check the target and OEM values
 for your hardware model. A reboot of the host applies BIOS updates.
 
+Ironic uploads the first multipart image when the step starts. For each
+later multipart image, it runs the step again, so that the periodic
+firmware status check of other nodes does not wait for the upload. During
+an upload, the node is in ``cleaning``, ``deploying`` or ``servicing``
+rather than ``clean wait``, ``deploy wait`` or ``service wait``.
+
+If the conductor stops during an upload, the step fails, because Ironic
+cannot tell whether the BMC got the image. An abort requested during the
+step takes effect before the next multipart upload, and the conductor logs
+the images it did not upload.
+
 With ``allow_grouping_reboots``, multipart and simple images can share a
 reboot, each using its own method.
 

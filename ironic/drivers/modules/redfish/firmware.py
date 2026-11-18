@@ -11,6 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import copy
 import datetime
 import tempfile
 import time
@@ -51,6 +52,10 @@ METRICS = metrics_utils.get_metrics_logger(__name__)
 #   updates:     the firmware updates still to finish, in order, each a
 #                dict with the 'component' and 'url' requested, and the
 #                PHASE it has reached once submitted
+#   requested:   the settings the step was called with, which the
+#                conductor passes again when it runs the step again
+#   rerun:       when the step asked the conductor to run it again, to
+#                upload the update in PHASE_UPLOADING; removed once it runs
 #
 # Staged firmware files to clean up stay under 'firmware_cleanup', which
 # firmware_utils and the management interface share.
@@ -66,9 +71,9 @@ LEGACY_KEYS = ('redfish_fw_updates', 'redfish_fw_update_start_time',
 # Where an update stands, in its 'phase' field. Updates of components
 # other than the BMC move staging -> staged -> applying, then waiting if
 # they set a 'wait'; a BMC update moves bmc_updating -> bmc_checking, then
-# applying if it needs a reboot of the node to take effect. An update
-# leaves the record once it is finished. _PHASE_MOVES declares these
-# moves.
+# applying if it needs a reboot of the node to take effect. A multipart
+# image after the first of a step starts in uploading. An update leaves
+# the record once it is finished. _PHASE_MOVES declares these moves.
 PHASE = 'phase'
 # The BMC is staging the update for the next reboot.
 PHASE_STAGING = 'staging'
@@ -83,6 +88,10 @@ PHASE_BMC_UPDATING = 'bmc_updating'
 # The BMC update task has finished; the BMC version shows whether the
 # update took effect without a reboot of the node.
 PHASE_BMC_CHECKING = 'bmc_checking'
+# A multipart image after the first of a step. The conductor runs the step
+# again to upload it, as it ran the step to upload the first, so that the
+# status poll, which checks every node in turn, does not wait for it.
+PHASE_UPLOADING = 'uploading'
 
 # What polls an update in each phase, with (task, update_service, settings,
 # fw_upd) where fw_upd is settings[0].
@@ -93,18 +102,20 @@ _PHASE_HANDLERS = {
     PHASE_WAITING: '_poll_waiting',
     PHASE_BMC_UPDATING: '_poll_bmc_updating',
     PHASE_BMC_CHECKING: '_poll_bmc_checking',
+    PHASE_UPLOADING: '_poll_uploading',
 }
 
 # The phases an update may move to from each phase; None is a new update.
 # Any other move is a bug, and fails the step.
 _PHASE_MOVES = {
-    None: {PHASE_STAGING, PHASE_BMC_UPDATING},
+    None: {PHASE_STAGING, PHASE_BMC_UPDATING, PHASE_UPLOADING},
     PHASE_STAGING: {PHASE_STAGED},
     PHASE_STAGED: {PHASE_APPLYING},
     PHASE_APPLYING: {PHASE_WAITING},
     PHASE_WAITING: set(),
     PHASE_BMC_UPDATING: {PHASE_BMC_CHECKING},
     PHASE_BMC_CHECKING: {PHASE_APPLYING},
+    PHASE_UPLOADING: {PHASE_STAGING, PHASE_BMC_UPDATING},
 }
 
 # Fields of an update, besides its phase.
@@ -150,6 +161,11 @@ _TASK_IN_PROGRESS = (sushy.TASK_STATE_NEW, sushy.TASK_STATE_RUNNING,
 def _name(value):
     """The Redfish name of a sushy enum value, for messages."""
     return getattr(value, 'value', value)
+
+
+def _components(settings):
+    """The components of firmware updates, for messages."""
+    return [fw_upd['component'] for fw_upd in settings]
 
 
 def _has_update(node):
@@ -395,6 +411,22 @@ class RedfishFirmware(base.FirmwareInterface):
         :returns: states.CLEANWAIT if Firmware update with the settings is in
             progress asynchronously of None if it is complete.
         """
+        record = task.node.driver_internal_info.get(FW_UPDATE)
+        if record and record.get('rerun'):
+            if record.get('requested') == settings:
+                # Run again by the conductor, to upload a multipart image.
+                self._upload_pending(task, record)
+                return async_steps.get_return_state(task.node)
+            # Left by an earlier step that ended before it ran again, for
+            # example one that failed.
+            LOG.warning('Discarding the firmware updates %(updates)s left on '
+                        'node %(node)s by an earlier step that did not '
+                        'finish.',
+                        {'node': task.node.uuid,
+                         'updates': _components(record['updates'])})
+            self._clear_updates(task.node)
+
+        requested = copy.deepcopy(settings)
         firmware_utils.validate_firmware_interface_update_args(settings)
         try:
             allow_grouping_reboots = strutils.bool_from_string(
@@ -420,6 +452,7 @@ class RedfishFirmware(base.FirmwareInterface):
             'version': RECORD_VERSION,
             'started_at': timeutils.utcnow().isoformat(),
             'grouping': allow_grouping_reboots,
+            'requested': requested,
             'updates': settings,
         })
         try:
@@ -757,7 +790,18 @@ class RedfishFirmware(base.FirmwareInterface):
         fw_upd = settings[0]
         self._submit_firmware_update(node, update_service, fw_upd)
         self._set_updates(node, settings)
+        self._track_submitted_update(node, fw_upd)
 
+    def _track_submitted_update(self, node, fw_upd):
+        """Start following a firmware update the BMC has accepted.
+
+        A BMC update is followed through the BMC firmware version. Any
+        other update is staged by the BMC and applied by rebooting the
+        node.
+
+        :param node: the node the update was submitted to.
+        :param fw_upd: the submitted firmware update.
+        """
         component_type = redfish_utils.get_component_type(
             fw_upd['component'])
         if component_type == redfish_utils.BMC:
@@ -1002,6 +1046,10 @@ class RedfishFirmware(base.FirmwareInterface):
                     return
 
             del settings[:count]
+            if settings[0].get('method') == 'multipart':
+                self._set_phase(node, settings[0], PHASE_UPLOADING)
+                self._rerun_to_upload(task, settings)
+                return
             # Saved before the request: if the conductor stops during it,
             # the next update has no phase yet, so the next poll fails the
             # step instead of submitting it a second time.
@@ -1105,6 +1153,11 @@ class RedfishFirmware(base.FirmwareInterface):
         node = task.node
         idx = next((i for i, u in enumerate(settings)
                     if u.get(PHASE) == PHASE_STAGING), None)
+        uploading = next((u for u in settings
+                          if u.get(PHASE) == PHASE_UPLOADING), None)
+        if idx is None and uploading is not None:
+            self._poll_uploading(task, update_service, settings, uploading)
+            return
         if idx is None:
             # The conductor stopped while submitting the next update of a
             # group, so its task, if the BMC created one, is unknown.
@@ -1182,6 +1235,10 @@ class RedfishFirmware(base.FirmwareInterface):
                      'before it.',
                      {'component': settings[nxt]['component'],
                       'node': node.uuid})
+            if settings[nxt].get('method') == 'multipart':
+                self._set_phase(node, settings[nxt], PHASE_UPLOADING)
+                self._rerun_to_upload(task, settings)
+                return
             # Saved before the request: if the conductor stops during it,
             # no update is left staging, so the next poll fails the step
             # instead of submitting the next update a second time.
@@ -1393,7 +1450,18 @@ class RedfishFirmware(base.FirmwareInterface):
         :param error_msg: the error message
         :param traceback: whether to include a traceback
         """
-        updates = (task.node.driver_internal_info.get(FW_UPDATE)
+        error_msg = self._with_staged_note(task.node, error_msg)
+        self._report_step_error(task, error_msg, traceback=traceback)
+        self._clear_updates(task.node)
+
+    def _with_staged_note(self, node, error_msg):
+        """Add a note naming firmware the BMC has already staged.
+
+        :param node: the Ironic node object
+        :param error_msg: the error message
+        :returns: the error message, with the note if anything is staged
+        """
+        updates = (node.driver_internal_info.get(FW_UPDATE)
                    or {}).get('updates') or []
         staged = [u['component'] for u in updates
                   if u.get(PHASE) == PHASE_STAGED]
@@ -1401,8 +1469,7 @@ class RedfishFirmware(base.FirmwareInterface):
             error_msg += _(' Firmware for %s is already staged on the BMC '
                            'and will be applied on the next reboot of the '
                            'node.') % ', '.join(staged)
-        self._report_step_error(task, error_msg, traceback=traceback)
-        self._clear_updates(task.node)
+        return error_msg
 
     def _fail_task(self, task, fw_upd, sushy_task):
         """Fail the step because a firmware update task failed.
@@ -2085,6 +2152,102 @@ class RedfishFirmware(base.FirmwareInterface):
                 task, update_service, settings, current_update)
         except exception.InvalidFirmwareUpdatePhase as e:
             self._fail(task, str(e))
+
+    def _rerun_to_upload(self, task, settings):
+        """Ask the conductor to run the step again to upload an image.
+
+        The conductor runs the step in one of its workers, with the node
+        locked, as it did to upload the first image of the step, so that
+        the status poll does not wait for the upload.
+
+        Before it runs the step again, the conductor checks for an abort
+        requested during the step, as it does when a step ends, and aborts
+        instead; the updates left are then not done.
+
+        :param task: a TaskManager instance with an exclusive lock
+        :param settings: firmware update settings, one of them uploading
+        """
+        node = task.node
+        step = node.clean_step or node.service_step or node.deploy_step or {}
+        if step.get('abort_after'):
+            LOG.warning('Not uploading the firmware updates %(updates)s of '
+                        'node %(node)s, since the step is to be aborted.',
+                        {'node': node.uuid, 'updates': _components(settings)})
+            self._clear_updates(node)
+            self._resume_step(task)
+            return
+
+        record = dict(node.driver_internal_info[FW_UPDATE], updates=settings)
+        record['rerun'] = str(timeutils.utcnow().isoformat())
+        node.set_driver_internal_info(FW_UPDATE, record)
+        deploy_utils.set_async_step_flags(node, reboot=False,
+                                          skip_current_step=False,
+                                          polling=True)
+        node.save()
+        LOG.info('Running the firmware update step of node %(node)s again '
+                 'to upload its multipart image.', {'node': node.uuid})
+        self._resume_step(task)
+
+    def _upload_pending(self, task, record):
+        """Upload the multipart image the step was run again for.
+
+        :param task: a TaskManager instance
+        :param record: the firmware update record of the node
+        :raises: RedfishError if the image cannot be uploaded; the
+            remaining updates are then discarded.
+        """
+        node = task.node
+        settings = record['updates']
+        fw_upd = next(u for u in settings if u.get(PHASE) == PHASE_UPLOADING)
+        # Removed before the upload. If the conductor stops during it, the
+        # node is left cleaning, deploying or servicing, which the
+        # conductor fails when it starts again, so nothing uploads twice.
+        record = dict(record)
+        del record['rerun']
+        node.set_driver_internal_info(FW_UPDATE, record)
+        node.save()
+
+        try:
+            update_service = redfish_utils.get_update_service(node)
+        except exception.RedfishConnectionError as e:
+            LOG.warning('Unable to communicate with firmware update service '
+                        'on node %(node)s to upload %(component)s firmware. '
+                        'Will try again on the next poll. Error: %(error)s',
+                        {'node': node.uuid, 'component': fw_upd['component'],
+                         'error': e})
+            deploy_utils.set_async_step_flags(node, reboot=False,
+                                              polling=True)
+            node.save()
+            return
+
+        LOG.info('Uploading %(component)s firmware to node %(node)s.',
+                 {'component': fw_upd['component'], 'node': node.uuid})
+        try:
+            self._submit_firmware_update(node, update_service, fw_upd)
+        except Exception as e:
+            error_msg = self._with_staged_note(node, _(
+                'Failed to submit %(component)s firmware for node '
+                '%(node)s: %(error)s') % {
+                    'component': fw_upd['component'],
+                    'node': node.uuid, 'error': e})
+            self._clear_updates(node)
+            raise exception.RedfishError(error=error_msg)
+        self._track_submitted_update(node, fw_upd)
+        self._save_updates(node, settings)
+
+    def _poll_uploading(self, task, update_service, settings, fw_upd):
+        """Poll a multipart image waiting for the step to run again.
+
+        The conductor normally runs the step again before the next poll.
+        If it has not, for example because no worker was free or the
+        BMC could not be reached, it is asked again.
+
+        :param task: a TaskManager instance
+        :param update_service: the sushy firmware update service
+        :param settings: firmware update settings
+        :param fw_upd: the update waiting for its upload
+        """
+        self._rerun_to_upload(task, settings)
 
     def _stage_firmware_file(self, node, component_update):
 
