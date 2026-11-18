@@ -116,7 +116,8 @@ STARTING_SINCE = 'starting_since'
 VERIFY = 'verify'
 # The BMC firmware version read before a BMC update.
 BMC_VERSION_BEFORE = 'bmc_version_before'
-# When the BMC update was submitted, which bounds the version checks.
+# When the BMC update was submitted, which bounds the version checks. For
+# a requested version, it restarts once the update task has ended.
 BMC_CHECK_START = 'bmc_check_start_time'
 
 # Fields of VERIFY.
@@ -135,6 +136,9 @@ VERIFY_NEW_BOOT = 'new_boot'
 VERIFY_BOOT_PASSED = 'boot_passed'
 # The first failed task seen, reported once nothing is in progress.
 VERIFY_FAILED = 'failed'
+# When the other checks had passed and a requested BIOS version was first
+# awaited, which bounds the wait for it.
+VERIFY_VERSION_SINCE = 'version_since'
 
 # Redfish task states of a task that has not finished.
 _TASK_IN_PROGRESS = (sushy.TASK_STATE_NEW, sushy.TASK_STATE_RUNNING,
@@ -464,19 +468,9 @@ class RedfishFirmware(base.FirmwareInterface):
         :param node: the Ironic node object
         :param fw_upd: firmware update settings dict
         """
-        # Record current BMC version before update
-        try:
-            system = redfish_utils.get_system(node)
-            manager = redfish_utils.get_manager(node, system)
-            current_bmc_version = manager.firmware_version
-            fw_upd[BMC_VERSION_BEFORE] = current_bmc_version
-            LOG.debug('BMC version before update for node %(node)s: '
-                      '%(version)s',
-                      {'node': node.uuid, 'version': current_bmc_version})
-        except Exception as e:
-            LOG.warning('Could not read BMC version before update for '
-                        'node %(node)s: %(error)s',
-                        {'node': node.uuid, 'error': e})
+        LOG.debug('BMC version before update for node %(node)s: %(version)s',
+                  {'node': node.uuid,
+                   'version': fw_upd.get(BMC_VERSION_BEFORE)})
 
         LOG.info('BMC firmware update for node %(node)s. '
                  'Monitoring BMC version instead of immediate reboot.',
@@ -568,6 +562,10 @@ class RedfishFirmware(base.FirmwareInterface):
                           'be read. Checking the BMC version instead.',
                           {'node': node.uuid})
 
+        if fw_upd.get('version') is not None:
+            # The BMC may still be resetting into the requested version,
+            # so its check time starts now, not at submission.
+            fw_upd[BMC_CHECK_START] = str(timeutils.utcnow().isoformat())
         self._set_phase(node, fw_upd, PHASE_BMC_CHECKING)
         self._check_bmc_version(task, update_service, settings, fw_upd)
 
@@ -585,10 +583,10 @@ class RedfishFirmware(base.FirmwareInterface):
     def _check_bmc_version(self, task, update_service, settings, fw_upd):
         """Check whether a BMC firmware update has taken effect.
 
-        For BMC updates, we don't reboot immediately. Instead, we check
-        the BMC version periodically. If the version changed, we continue
-        without reboot. If timeout expires without version change, we trigger
-        a reboot.
+        Require an exact match when a version was requested. Otherwise,
+        keep the existing version-change and same-version timeout behavior.
+        The configured reboot delay bounds the check. For a requested
+        version, it counts from the end of the BMC's update task.
 
         :param task: a TaskManager instance
         :param update_service: the sushy firmware update service
@@ -604,10 +602,12 @@ class RedfishFirmware(base.FirmwareInterface):
         current_version = self._get_current_bmc_version(node)
         version_before = fw_upd.get(BMC_VERSION_BEFORE)
 
-        # If we can read the version and it changed, update is complete
-        if (current_version is not None
-                and version_before is not None
-                and current_version != version_before):
+        desired_version = fw_upd.get('version')
+        matches = (current_version == desired_version
+                   if desired_version is not None
+                   else version_before is not None
+                   and current_version != version_before)
+        if current_version is not None and matches:
             LOG.info('BMC firmware version for node %(node)s changed '
                      'from %(old)s to %(new)s.',
                      {'node': node.uuid, 'old': version_before,
@@ -627,6 +627,13 @@ class RedfishFirmware(base.FirmwareInterface):
             check_start) if check_start else datetime.timedelta())
         if (check_start and elapsed.total_seconds()
                 >= CONF.redfish.firmware_update_reboot_delay):
+            if desired_version is not None:
+                self._fail(task, _(
+                    'BMC firmware did not reach requested version '
+                    '%(expected)s; observed %(actual)s.') % {
+                        'expected': desired_version,
+                        'actual': current_version})
+                return
             # Timeout: version didn't change or BMC unresponsive
             if (current_version is not None
                     and version_before is not None
@@ -696,6 +703,9 @@ class RedfishFirmware(base.FirmwareInterface):
 
     def _submit_firmware_update(self, node, update_service, fw_upd):
         """Submit one image through its selected transport."""
+        if fw_upd['component'] == redfish_utils.BMC:
+            # The upload itself may reset the BMC or install the image.
+            fw_upd[BMC_VERSION_BEFORE] = self._get_current_bmc_version(node)
         if fw_upd.get('method', 'simple') == 'multipart':
             self._submit_multipart_update(node, update_service, fw_upd)
         else:
@@ -1536,6 +1546,7 @@ class RedfishFirmware(base.FirmwareInterface):
             VERIFY_NEW_BOOT: False,
             VERIFY_BOOT_PASSED: False,
             VERIFY_FAILED: None,
+            VERIFY_VERSION_SINCE: None,
         }
         deploy_utils.set_async_step_flags(node, reboot=True, polling=True)
         self._save_updates(node, settings)
@@ -1636,6 +1647,9 @@ class RedfishFirmware(base.FirmwareInterface):
           ``[redfish]firmware_update_post_reboot_wait``, the update continues
           with a warning, since not every BMC shows it. A node that
           reports no BootProgress waits that long.
+        * A BIOS image with a requested ``version``: the System reports that
+          version within ``[redfish]firmware_update_reboot_delay`` of the
+          other checks passing.
 
         A task or Lifecycle Controller job still in progress is only
         bounded by ``[redfish]firmware_update_overall_timeout``.
@@ -1765,7 +1779,55 @@ class RedfishFirmware(base.FirmwareInterface):
 
         if failure:
             raise failure
-        return waiting
+        if waiting is not None:
+            return waiting
+
+        # 4. A requested BIOS version is installed.
+        return self._check_bios_version(node, system, applying, verify)
+
+    def _check_bios_version(self, node, system, applying, verify):
+        """Check that a requested BIOS version is installed.
+
+        Some BMCs report the new version only some time after the host has
+        booted, so once the other checks have passed, the BIOS has
+        ``[redfish]firmware_update_reboot_delay`` seconds to report it.
+
+        :param node: an Ironic node object.
+        :param system: the sushy System read in this poll, or None if it
+            could not be read.
+        :param applying: the firmware updates the reboot applies.
+        :param verify: their ``VERIFY`` state, updated in place.
+        :returns: None if no BIOS version was requested or it is installed,
+            otherwise what is still awaited.
+        :raises: IronicException if the requested version is not reported
+            in time.
+        """
+        expected = None
+        for fw_upd in applying:
+            if fw_upd['component'] == redfish_utils.BIOS:
+                expected = fw_upd.get('version')
+        if expected is None:
+            return None
+
+        installed = None
+        if system is not None:
+            installed = system.bios_version
+        if installed == expected:
+            LOG.info('BIOS firmware version %(version)s is installed on node '
+                     '%(node)s.', {'version': installed, 'node': node.uuid})
+            return None
+
+        if verify[VERIFY_VERSION_SINCE] is None:
+            verify[VERIFY_VERSION_SINCE] = timeutils.utcnow().isoformat()
+        since = timeutils.parse_isotime(verify[VERIFY_VERSION_SINCE])
+        elapsed = (timeutils.utcnow(True) - since).total_seconds()
+        if elapsed >= CONF.redfish.firmware_update_reboot_delay:
+            raise exception.IronicException(_(
+                'BIOS firmware did not reach requested version '
+                '%(expected)s; observed %(actual)s.') % {
+                    'expected': expected, 'actual': installed})
+        return _('the BIOS version is %(actual)s, not the requested '
+                 '%(expected)s') % {'actual': installed, 'expected': expected}
 
     def _check_tasks(self, node, applying, verify):
         """Read the task of every update a reboot applies.

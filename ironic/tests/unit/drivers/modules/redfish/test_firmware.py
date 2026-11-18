@@ -2616,7 +2616,7 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
         verify = {'reboot_time': self.now.isoformat(),
                   'before': {'state': 'OSRunning'},
                   'jids': [], 'new_boot': False, 'boot_passed': False,
-                  'failed': None}
+                  'failed': None, 'version_since': None}
         verify.update(fields)
         return verify
 
@@ -4682,3 +4682,173 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
         self.assertEqual([redfish_fw.PHASE_STAGED, redfish_fw.PHASE_STAGING],
                          [u['phase'] for u in self._updates()])
         self.mocks['clean_error'].assert_not_called()
+
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
+    @mock.patch.object(redfish_fw.firmware_utils, 'download_to_temp',
+                       autospec=True)
+    def test_bmc_baseline_precedes_both_transport_submissions(
+            self, download_mock, manager_mock, collection_mock):
+        collection_mock.return_value.members_identities = ['/Systems/1']
+        service = self.mocks['update_service'].return_value
+        download_mock.side_effect = (
+            lambda node, url, temp_dir: temp_dir + '/image.bin')
+        for method in ('simple', 'multipart'):
+            manager_mock.return_value.firmware_version = 'before'
+
+            def submit(*args, **kwargs):
+                manager_mock.return_value.firmware_version = 'after'
+                return mock.Mock(task_monitor_uri='/tasks/bmc')
+
+            service.simple_update.side_effect = submit
+            service.multipart_update.side_effect = submit
+            settings = [{'component': 'bmc', 'url': 'http://fw/bmc.bin',
+                         'method': method}]
+            with task_manager.acquire(self.context, self.node.uuid,
+                                      shared=False) as task:
+                self.firmware.update(task, settings)
+            self.node.refresh()
+            self.assertEqual('before', self._updates()[0][
+                redfish_fw.BMC_VERSION_BEFORE])
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_get_current_bmc_version', autospec=True)
+    def test_requested_bmc_version_does_not_accept_other_changed_version(
+            self, version_mock):
+        version_mock.return_value = 'different'
+        update = self._update('bmc', phase=redfish_fw.PHASE_BMC_CHECKING,
+                              version='requested', bmc_version_before='old',
+                              bmc_check_start_time=self.now.isoformat())
+        self._set_updates(update)
+        self._poll()
+        self._assert_waiting(redfish_fw.PHASE_BMC_CHECKING)
+        self.assertEqual('requested', self._updates()[0]['version'])
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_get_current_bmc_version', autospec=True)
+    def test_requested_bmc_version_timeout_fails_without_reboot(
+            self, version_mock):
+        for observed in ('different', None):
+            version_mock.return_value = observed
+            update = self._update('bmc', phase=redfish_fw.PHASE_BMC_CHECKING,
+                                  version='requested',
+                                  bmc_version_before='old',
+                                  bmc_check_start_time=self.now.isoformat())
+            self._set_updates(update)
+            self._advance(CONF.redfish.firmware_update_reboot_delay)
+            self.mocks['clean_error'].reset_mock()
+            self._poll()
+            self._assert_failed('did not reach requested version requested')
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_get_current_bmc_version', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    def test_requested_bmc_version_exact_match_completes(
+            self, resume_mock, cache_mock, stable_mock, version_mock):
+        version_mock.return_value = 'requested'
+        update = self._update('bmc', phase=redfish_fw.PHASE_BMC_CHECKING,
+                              version='requested', bmc_version_before='old',
+                              bmc_check_start_time=self.now.isoformat())
+        self._set_updates(update)
+        self._poll()
+        resume_mock.assert_called_once()
+        stable_mock.assert_called_once()
+        self.assertIsNone(self._updates())
+        self.mocks['clean_error'].assert_not_called()
+
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    def test_requested_bmc_version_checked_after_task_ends(
+            self, resume_mock, cache_mock, stable_mock, manager_mock,
+            collection_mock):
+        collection_mock.return_value.members_identities = ['/Systems/1']
+        self._submits('bmc')
+        tasks = self._fake_tasks()
+        manager_mock.return_value.firmware_version = '1.0'
+        settings = [{'component': 'bmc', 'url': 'http://fw/bmc.bin',
+                     'version': '2.0'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.firmware.update(task, settings)
+        self.node.refresh()
+        # The task has finished by the first check, but the BMC is still
+        # resetting into the new image.
+        tasks['/tasks/bmc'] = sushy.TASK_STATE_COMPLETED
+        manager_mock.side_effect = exception.RedfishError(error='resetting')
+        self._advance(CONF.redfish.firmware_update_reboot_delay)
+        self._poll()
+        self._assert_waiting(redfish_fw.PHASE_BMC_CHECKING)
+        # It reports the requested version at a later check.
+        manager_mock.side_effect = None
+        manager_mock.return_value.firmware_version = '2.0'
+        self._advance(
+            CONF.redfish.firmware_update_bmc_version_check_interval)
+        self._poll()
+        resume_mock.assert_called_once()
+        self.assertIsNone(self._updates())
+        self.mocks['clean_error'].assert_not_called()
+
+    def _applying_bios_version(self, installed, version='2.0'):
+        """A BIOS update with a requested version, rebooted to apply it."""
+        bios = self._applying()
+        bios['version'] = version
+        self._set_updates(bios)
+        self._set_task(sushy.TASK_STATE_COMPLETED)
+        self._reset_host()
+        self.mocks['system'].return_value.bios_version = installed
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_updates',
+                       autospec=True)
+    def test_requested_bios_version_installed(self, continue_mock):
+        self._applying_bios_version(installed='2.0')
+
+        self._poll()
+
+        continue_mock.assert_called_once()
+        self.assertIsNone(
+            self._updates()[0][redfish_fw.VERIFY]['version_since'])
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_updates',
+                       autospec=True)
+    def test_requested_bios_version_reported_late(self, continue_mock):
+        self._applying_bios_version(installed='1.0')
+
+        self._poll()
+
+        # The boot has passed, but the BMC still reports the old version
+        self._assert_waiting(redfish_fw.PHASE_APPLYING)
+        continue_mock.assert_not_called()
+        verify = self._updates()[0][redfish_fw.VERIFY]
+        self.assertTrue(verify['boot_passed'])
+        self.assertEqual(self.now.isoformat(), verify['version_since'])
+
+        self._advance(CONF.redfish.firmware_update_reboot_delay - 1)
+        self.mocks['system'].return_value.bios_version = '2.0'
+        self._poll()
+
+        continue_mock.assert_called_once()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_updates',
+                       autospec=True)
+    def test_requested_bios_version_not_reached_fails(self, continue_mock):
+        self._applying_bios_version(installed='1.0')
+        self._poll()
+        self._assert_waiting(redfish_fw.PHASE_APPLYING)
+
+        self._advance(CONF.redfish.firmware_update_reboot_delay)
+        self._poll()
+
+        continue_mock.assert_not_called()
+        self._assert_failed('BIOS firmware did not reach requested version '
+                            '2.0; observed 1.0.')
