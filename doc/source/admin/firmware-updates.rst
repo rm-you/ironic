@@ -505,9 +505,11 @@ as ``/redfish/v1/UpdateService/FirmwareInventory/BIOS``, and
 Inventory member names and OEM values are supplied by the operator.
 
 The conductor uploads the first multipart image of a step when the step
-starts. It uploads each later one during its periodic firmware status
-check, which checks other nodes only once the upload has finished. With
-large images on many nodes, those checks are delayed by the upload time.
+starts. For each later one, it runs the step again, so that the periodic
+firmware status check of other nodes does not wait for the upload. While
+it uploads, the node shows the cleaning, deploying or servicing state
+instead of the waiting one. If the conductor stops during an upload, the
+step fails, since whether the BMC received the image is unknown.
 
 Multipart images can share a reboot with SimpleUpdate images when
 ``allow_grouping_reboots`` is enabled. Each image uses its selected method,
