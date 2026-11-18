@@ -392,6 +392,22 @@ can also install an older version. Other components do not accept
 With ``allow_grouping_reboots``, this check also runs just before each
 later image in the group is staged.
 
+Version confirmation
+--------------------
+
+When a BIOS image sets ``version``, the System must report that version
+after the reboot that applies it. Once the other checks after the reboot
+have passed (the task, the boot and any Dell Lifecycle Controller jobs),
+the BIOS has ``[redfish]firmware_update_reboot_delay`` seconds to show the
+new version. If it does not, the step fails.
+
+When a BMC image sets ``version``, the BMC must report exactly that version
+after its update task has ended. Any other version, even a new one, does
+not count. The BMC has ``[redfish]firmware_update_reboot_delay`` seconds
+after the task ends to show it, checked every
+``[redfish]firmware_update_bmc_version_check_interval`` seconds. If it does
+not, the step fails.
+
 How it works - via Management Interface
 ---------------------------------------
 

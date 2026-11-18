@@ -1,0 +1,8 @@
+---
+features:
+  - |
+    When a Redfish BIOS or BMC firmware image sets ``version``, the update
+    now fails unless that exact version is reported afterwards. The BMC must
+    report it within ``[redfish]firmware_update_reboot_delay`` seconds after
+    its update task ends, and the BIOS within the same time after the checks
+    that follow its reboot have passed.
