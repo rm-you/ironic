@@ -11,6 +11,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import copy
 import datetime
 import functools
 import json
@@ -23,6 +24,7 @@ import sushy
 
 from ironic.common import exception
 from ironic.common import states
+from ironic.conductor import cleaning
 from ironic.conductor import task_manager
 from ironic.conductor import utils as manager_utils
 from ironic.conf import CONF
@@ -43,7 +45,9 @@ def _record(updates, grouping=False, started_at=None):
     """The driver_internal_info record of a firmware update step."""
     return {'version': redfish_fw.RECORD_VERSION,
             'started_at': started_at or timeutils.utcnow().isoformat(),
-            'grouping': grouping, 'updates': updates}
+            'grouping': grouping,
+            redfish_fw.REQUESTED: copy.deepcopy(updates),
+            'updates': updates}
 
 
 def _updates(node):
@@ -2671,6 +2675,19 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
         self.node.refresh()
         return task
 
+    def _run_step_again(self):
+        """Run the step again, as the conductor does when asked to.
+
+        The conductor passes the settings the step was called with.
+        """
+        record = self.node.driver_internal_info[redfish_fw.FW_UPDATE]
+        settings = copy.deepcopy(record[redfish_fw.REQUESTED])
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            result = self.firmware.update(task, settings)
+        self.node.refresh()
+        return result
+
     def _updates(self):
         return _updates(self.node)
 
@@ -3726,6 +3743,7 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
             (redfish_fw.PHASE_WAITING, 'bios', '_poll_waiting'),
             (redfish_fw.PHASE_BMC_UPDATING, 'bmc', '_poll_bmc_updating'),
             (redfish_fw.PHASE_BMC_CHECKING, 'bmc', '_poll_bmc_checking'),
+            (redfish_fw.PHASE_UPLOADING, 'bios', '_poll_uploading'),
         ]
         self.assertEqual({phase for phase, _c, _h in cases},
                          set(redfish_fw._PHASE_HANDLERS))
@@ -3795,7 +3813,7 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
         self.assertEqual(
             {'version': redfish_fw.RECORD_VERSION,
              'started_at': self.now.isoformat(), 'grouping': True,
-             'updates': settings},
+             redfish_fw.REQUESTED: settings, 'updates': settings},
             self.node.driver_internal_info[redfish_fw.FW_UPDATE])
 
     @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
@@ -4547,11 +4565,14 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
         self.mocks['clean_error'].assert_not_called()
         self.assertNotIn(redfish_fw.FW_UPDATE, self.node.driver_internal_info)
 
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
     @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
     @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_multipart_update',
                        autospec=True)
     def test_grouping_dispatches_each_image_transport(self, push_mock,
-                                                      collection_mock):
+                                                      collection_mock,
+                                                      resume_mock):
         collection_mock.return_value.members_identities = ['/Systems/1']
         update_service = self._submits('nic1')
         tasks = self._fake_tasks()
@@ -4572,9 +4593,15 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
                                   shared=False) as task:
             self.firmware.update(task, settings, allow_grouping_reboots=True)
         self.node.refresh()
-        for name in ('bios', 'nic1', 'nic2'):
-            tasks['/tasks/' + name] = sushy.TASK_STATE_COMPLETED
-            self._poll()
+        tasks['/tasks/bios'] = sushy.TASK_STATE_COMPLETED
+        self._poll()
+        tasks['/tasks/nic1'] = sushy.TASK_STATE_COMPLETED
+        self._poll()
+        # The conductor runs the step again to upload nic2.
+        resume_mock.assert_called_once()
+        self._run_step_again()
+        tasks['/tasks/nic2'] = sushy.TASK_STATE_COMPLETED
+        self._poll()
         self.assertEqual(2, push_mock.call_count)
         update_service.simple_update.assert_called_once_with(
             'http://fw/nic1.bin')
@@ -4849,3 +4876,320 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
         continue_mock.assert_not_called()
         self._assert_failed('BIOS firmware did not reach requested version '
                             '2.0; observed 1.0.')
+
+    @staticmethod
+    def _pushes(task_monitor):
+        """A multipart upload that the BMC answers with task_monitor."""
+        def push(interface, node, update_service, fw_upd):
+            fw_upd['task_monitor'] = task_monitor
+            fw_upd['power_timeout'] = 300
+        return push
+
+    def _uploading(self, *before, **record):
+        """A BIOS image waiting to upload, after the given updates."""
+        bios = self._update('bios', phase=redfish_fw.PHASE_UPLOADING,
+                            method='multipart', task_monitor=None)
+        self._set_updates(*before, bios, **record)
+        info = self.node.driver_internal_info
+        info[redfish_fw.FW_UPDATE][redfish_fw.RERUN] = self.now.isoformat()
+        self.node.driver_internal_info = info
+        self.node.save()
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_multipart_update',
+                       autospec=True)
+    def test_later_multipart_image_uploaded_by_running_step_again(
+            self, push_mock, resume_mock):
+        push_mock.side_effect = self._pushes('/tasks/bios')
+        nic = self._update('nic:NIC.1', phase=redfish_fw.PHASE_WAITING,
+                           wait=1, wait_start_time=self.now.isoformat())
+        bios = {'component': 'bios', 'url': 'http://fw/bios.bin',
+                'method': 'multipart'}
+        self._set_updates(nic, bios)
+        self._advance(10)
+        # The status poll does not upload the image itself, but asks the
+        # conductor to run the step again.
+        self._poll()
+        push_mock.assert_not_called()
+        resume_mock.assert_called_once()
+        self._assert_waiting(redfish_fw.PHASE_UPLOADING)
+        info = self.node.driver_internal_info
+        self.assertIn(redfish_fw.RERUN, info[redfish_fw.FW_UPDATE])
+        self.assertFalse(info['skip_current_clean_step'])
+        # Run again, the step uploads it.
+        self.assertEqual(states.CLEANWAIT, self._run_step_again())
+        push_mock.assert_called_once()
+        update = self._updates()[0]
+        self.assertEqual(redfish_fw.PHASE_STAGING, update['phase'])
+        self.assertEqual('/tasks/bios', update['task_monitor'])
+        self.assertNotIn(redfish_fw.RERUN,
+                         self.node.driver_internal_info[redfish_fw.FW_UPDATE])
+        self.mocks['clean_error'].assert_not_called()
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_multipart_update',
+                       autospec=True)
+    def test_grouping_later_multipart_image_uploaded_by_running_step_again(
+            self, push_mock, resume_mock):
+        push_mock.side_effect = self._pushes('/tasks/nic2')
+        tasks = self._fake_tasks()
+        tasks['/tasks/nic1'] = sushy.TASK_STATE_COMPLETED
+        nic1 = self._update('nic:NIC.1', task_monitor='/tasks/nic1')
+        nic2 = {'component': 'nic:NIC.2', 'url': 'http://fw/nic2.bin',
+                'method': 'multipart'}
+        self._set_updates(nic1, nic2, grouping=True)
+        self._poll()
+        push_mock.assert_not_called()
+        resume_mock.assert_called_once()
+        self.assertEqual([redfish_fw.PHASE_STAGED, redfish_fw.PHASE_UPLOADING],
+                         [u['phase'] for u in self._updates()])
+        self._run_step_again()
+        push_mock.assert_called_once()
+        self.assertEqual([redfish_fw.PHASE_STAGED, redfish_fw.PHASE_STAGING],
+                         [u['phase'] for u in self._updates()])
+        self.mocks['power'].assert_not_called()
+        self.mocks['clean_error'].assert_not_called()
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    def test_poll_asks_again_to_run_step(self, resume_mock):
+        # The conductor did not run the step again, for example because no
+        # worker was free.
+        self._uploading()
+        self._poll()
+        resume_mock.assert_called_once()
+        self._assert_waiting(redfish_fw.PHASE_UPLOADING)
+        self.assertIn(redfish_fw.RERUN,
+                      self.node.driver_internal_info[redfish_fw.FW_UPDATE])
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_multipart_update',
+                       autospec=True)
+    def test_upload_failure_fails_step(self, push_mock):
+        push_mock.side_effect = exception.RedfishError(error='upload failed')
+        self._uploading(self._update('nic:NIC.1',
+                                     phase=redfish_fw.PHASE_STAGED),
+                        grouping=True)
+        error = self.assertRaises(exception.RedfishError,
+                                  self._run_step_again)
+        self.assertIn('Failed to submit bios firmware', str(error))
+        self.assertIn('Firmware for nic:NIC.1 is already staged', str(error))
+        self.node.refresh()
+        self.assertIsNone(self._updates())
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_multipart_update',
+                       autospec=True)
+    def test_upload_os_error_fails_step(self, push_mock):
+        push_mock.side_effect = OSError(28, 'No space left on device')
+        self._uploading()
+        error = self.assertRaises(exception.RedfishError,
+                                  self._run_step_again)
+        self.assertIn('No space left on device', str(error))
+        self.node.refresh()
+        self.assertIsNone(self._updates())
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_multipart_update',
+                       autospec=True)
+    def test_upload_waits_for_reachable_update_service(self, push_mock,
+                                                       resume_mock):
+        self._uploading()
+        self.mocks['update_service'].side_effect = [
+            exception.RedfishConnectionError(node=self.node.uuid,
+                                             error='BMC busy'),
+            mock.Mock()]
+        self.assertEqual(states.CLEANWAIT, self._run_step_again())
+        push_mock.assert_not_called()
+        self._assert_waiting(redfish_fw.PHASE_UPLOADING)
+        self.assertNotIn(redfish_fw.RERUN,
+                         self.node.driver_internal_info[redfish_fw.FW_UPDATE])
+        # The next poll asks for the step to run again.
+        self._poll()
+        resume_mock.assert_called_once()
+
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_multipart_update',
+                       autospec=True)
+    def test_new_step_ignores_left_over_upload(self, push_mock,
+                                               collection_mock):
+        # A record left by an earlier step, not waiting to run again.
+        collection_mock.return_value.members_identities = ['/Systems/1']
+        self._set_updates(self._update('bios',
+                                       phase=redfish_fw.PHASE_UPLOADING,
+                                       method='multipart'))
+        update_service = self._submits('nic1')
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.firmware.update(task, [{'component': 'nic:NIC.1',
+                                         'url': 'http://fw/nic1.bin'}])
+        self.node.refresh()
+        push_mock.assert_not_called()
+        update_service.simple_update.assert_called_once_with(
+            'http://fw/nic1.bin')
+        self.assertEqual(['nic:NIC.1'],
+                         [u['component'] for u in self._updates()])
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_multipart_update',
+                       autospec=True)
+    def test_new_step_discards_upload_left_to_run_again(self, push_mock):
+        # A step asked to be run again, but ended first, for example
+        # because it failed. A later step is called with other settings.
+        push_mock.side_effect = self._pushes('/tasks/bios')
+        self._uploading()
+        settings = [{'component': 'bios', 'url': 'http://fw/bios-2.bin',
+                     'method': 'multipart'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.firmware.update(task, copy.deepcopy(settings))
+        self.node.refresh()
+        push_mock.assert_called_once()
+        self.assertEqual('http://fw/bios-2.bin',
+                         push_mock.call_args.args[3]['url'])
+        record = self.node.driver_internal_info[redfish_fw.FW_UPDATE]
+        self.assertEqual(settings, record[redfish_fw.REQUESTED])
+        self.assertNotIn(redfish_fw.RERUN, record)
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_multipart_update',
+                       autospec=True)
+    def test_abort_during_step_leaves_later_images(self, push_mock,
+                                                   resume_mock):
+        # The step is not abortable, so an abort requested during it only
+        # flags the step. The conductor checks the flag before it runs
+        # the step again, and aborts.
+        nic = self._update('nic:NIC.1', phase=redfish_fw.PHASE_WAITING,
+                           wait=1, wait_start_time=self.now.isoformat())
+        bios = {'component': 'bios', 'url': 'http://fw/bios.bin',
+                'method': 'multipart'}
+        self._set_updates(nic, bios)
+        self.node.clean_step = {'step': 'update', 'interface': 'firmware',
+                                'abortable': False, 'abort_after': True}
+        self.node.target_provision_state = states.MANAGEABLE
+        self.node.save()
+        self._advance(10)
+        self._poll()
+        resume_mock.assert_called_once()
+        self.assertNotIn(redfish_fw.FW_UPDATE, self.node.driver_internal_info)
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.process_event('resume')
+            with mock.patch.object(task.driver.deploy, 'tear_down_cleaning',
+                                   autospec=True):
+                cleaning.continue_node_clean(task)
+        self.node.refresh()
+        self.assertEqual(states.CLEANFAIL, self.node.provision_state)
+        self.assertFalse(self.node.maintenance)
+        push_mock.assert_not_called()
+        self.assertNotIn(redfish_fw.FW_UPDATE, self.node.driver_internal_info)
+
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    def test_upload_left_by_earlier_step_not_run_in_another(self,
+                                                            resume_mock):
+        # A record left by a firmware step that did not finish, while the
+        # node waits in another step.
+        self._uploading()
+        self.node.clean_step = {'step': 'erase_devices',
+                                'interface': 'deploy'}
+        self.node.save()
+        self._poll()
+        resume_mock.assert_not_called()
+        self.assertNotIn(redfish_fw.FW_UPDATE, self.node.driver_internal_info)
+        self.assertNotIn('skip_current_clean_step',
+                         self.node.driver_internal_info)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_submit_multipart_update',
+                       autospec=True)
+    def test_bios_then_bmc_multipart_with_versions_end_to_end(
+            self, push_mock, manager_mock, resume_mock, validate_mock,
+            cache_mock):
+        # One step, BIOS then BMC, both pushed with a requested version and
+        # no grouping: the BIOS is pushed when the step starts, applied by a
+        # reboot and its version checked; the BMC is pushed by running the
+        # step again, and its version checked once its task ends. The
+        # conductor runs the step, both times with the arguments it saved.
+        def push(interface, node, update_service, fw_upd):
+            fw_upd['task_monitor'] = '/tasks/%s' % fw_upd['component']
+            fw_upd['power_timeout'] = 300
+
+        push_mock.side_effect = push
+        tasks = self._fake_tasks()
+        self._reset_on_reboot()
+        self.mocks['system'].return_value.bios_version = '1.0'
+        manager_mock.return_value.firmware_version = '1.0'
+
+        settings = [{'component': 'bios', 'url': 'http://fw/bios.bin',
+                     'method': 'multipart', 'version': '2.0'},
+                    {'component': 'bmc', 'url': 'http://fw/bmc.bin',
+                     'method': 'multipart', 'version': '2.0'}]
+        step = {'step': 'update', 'interface': 'firmware', 'priority': 0,
+                'abortable': False, 'args': {'settings': settings}}
+        self.node.provision_state = states.CLEANING
+        self.node.target_provision_state = states.MANAGEABLE
+        self.node.driver_internal_info = {'clean_steps': [step]}
+        self.node.save()
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            cleaning.do_next_clean_step(task, 0)
+        self.node.refresh()
+        self.assertEqual(states.CLEANWAIT, self.node.provision_state)
+        self.assertEqual(['bios'], [c[0][3]['component']
+                                    for c in push_mock.call_args_list])
+
+        # BIOS: staged, then applied by one reboot
+        tasks['/tasks/bios'] = sushy.TASK_STATE_COMPLETED
+        self._poll()
+        self.assertEqual(1, self.mocks['power'].call_count)
+        self.assertEqual(redfish_fw.PHASE_APPLYING,
+                         self._updates()[0]['phase'])
+        # The node has booted, but the BMC still reports the old BIOS
+        self._poll()
+        self.assertEqual(redfish_fw.PHASE_APPLYING,
+                         self._updates()[0]['phase'])
+        resume_mock.assert_not_called()
+        # The new BIOS version shows: the BMC image waits to be pushed by
+        # running the step again
+        self._advance(60)
+        self.mocks['system'].return_value.bios_version = '2.0'
+        self._poll()
+        update = self._updates()[0]
+        self.assertEqual(('bmc', redfish_fw.PHASE_UPLOADING),
+                         (update['component'], update['phase']))
+        resume_mock.assert_called_once()
+        self.assertEqual(1, push_mock.call_count)
+
+        # BMC: pushed when the step runs again, then confirmed by version
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.process_event('resume')
+            cleaning.continue_node_clean(task)
+        self.node.refresh()
+        self.assertEqual(states.CLEANWAIT, self.node.provision_state)
+        self.assertEqual(['bios', 'bmc'], [c[0][3]['component']
+                                           for c in push_mock.call_args_list])
+        self.assertEqual('1.0', self._updates()[0][
+            redfish_fw.BMC_VERSION_BEFORE])
+        # Its task is first read once its wait, by default the reboot
+        # delay, has passed.
+        tasks['/tasks/bmc'] = sushy.TASK_STATE_COMPLETED
+        manager_mock.return_value.firmware_version = '2.0'
+        self._advance(CONF.redfish.firmware_update_reboot_delay)
+        self._poll()
+
+        self.assertEqual(1, self.mocks['power'].call_count)
+        self.assertEqual(2, resume_mock.call_count)
+        validate_mock.assert_called_once()
+        cache_mock.assert_called_once()
+        self.mocks['clean_error'].assert_not_called()
+        self.assertNotIn(redfish_fw.FW_UPDATE, self.node.driver_internal_info)
