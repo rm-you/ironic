@@ -102,15 +102,17 @@ def check_scheduled_idrac_job(task, current_update):
 
     Used when the Redfish task of a firmware update disappears before
     Ironic sees it finish. If the job is still scheduled or running, the
-    firmware is staged and the next reboot applies it. If the job has
-    finished or does not exist, nothing is left to apply.
+    firmware is staged and the next reboot applies it. If it finished
+    successfully, the firmware is staged or, as some NICs do, already
+    applied without a reboot. If it failed or does not exist, the
+    firmware was not staged.
 
     :param task: a TaskManager instance
     :param current_update: the current firmware update being processed
-    :returns: True if the job is still scheduled or running, False if it
-        has finished (successfully or not) or does not exist, None if
-        the task monitor does not name a job or the Dell OEM job
-        collection is not available
+    :returns: True if the job is still scheduled or running, or finished
+        successfully, False if it failed or does not exist, None if the
+        task monitor does not name a job or the Dell OEM job collection
+        is not available
     :raises: RedfishError, RedfishConnectionError or
         sushy.exceptions.SushyError if the job collection cannot be read;
         the job may still exist, so the caller should check again later.
@@ -133,13 +135,13 @@ def check_scheduled_idrac_job(task, current_update):
                   'firmware staging succeeded.',
                   {'jid': jid, 'node': node.uuid})
         return True
-    if status == LCJobStatus.ERROR:
-        LOG.warning('LC job %(jid)s for node %(node)s did not leave '
-                    'firmware to apply: %(detail)s',
-                    {'jid': jid, 'node': node.uuid, 'detail': detail})
-    else:
+    if status == LCJobStatus.DONE:
         LOG.debug('LC job %(jid)s for node %(node)s has already '
-                  'finished.', {'jid': jid, 'node': node.uuid})
+                  'finished successfully.', {'jid': jid, 'node': node.uuid})
+        return True
+    LOG.warning('LC job %(jid)s for node %(node)s did not leave '
+                'firmware to apply: %(detail)s',
+                {'jid': jid, 'node': node.uuid, 'detail': detail})
     return False
 
 

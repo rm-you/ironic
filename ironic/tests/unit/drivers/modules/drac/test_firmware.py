@@ -414,6 +414,7 @@ class CheckScheduledIdracJobTestCase(_LcJobsTestBase):
 
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     def test_finished(self, get_system_mock):
+        # Staged, or applied without a reboot as some NICs do.
         job = _dell_job('JID_839968767020', 'Completed',
                         'Job completed successfully.')
         self._mock_job_collection(get_system_mock, jobs=[job])
@@ -422,7 +423,7 @@ class CheckScheduledIdracJobTestCase(_LcJobsTestBase):
                                   shared=False) as task:
             result = drac_fw.check_scheduled_idrac_job(task, self.UPDATE)
 
-        self.assertIs(result, False)
+        self.assertIs(result, True)
 
     @mock.patch.object(redfish_utils, 'get_system', autospec=True)
     def test_failed(self, get_system_mock):

@@ -1,0 +1,18 @@
+---
+upgrade:
+  - |
+    Each Redfish BIOS or NIC firmware update is now applied by its own
+    reboot of the node, as soon as the BMC has staged it. Previously,
+    consecutive NIC updates could share a single reboot at the end of the
+    step.
+  - |
+    A BIOS or NIC firmware update started by an earlier version of Ironic
+    and not yet rebooted to apply cannot be resumed by this version, and
+    fails. Let in-flight firmware updates finish before upgrading the
+    conductor.
+deprecations:
+  - |
+    The ``[redfish]firmware_update_nic_starting_wait`` option is renamed to
+    ``[redfish]firmware_update_starting_wait``, as it now applies to the
+    firmware updates of every component other than the BMC. The old name
+    is deprecated and still accepted.
