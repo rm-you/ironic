@@ -2413,6 +2413,44 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             # Verify _continue_updates was NOT called (reboot happens first)
             mock_continue_updates.assert_not_called()
 
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_updates',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_get_current_bmc_version', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test_bmc_version_change_with_grouping_continues_without_reboot(
+            self, mock_get_update_service, mock_get_bmc_version,
+            mock_continue_updates, mock_power_action):
+        """With grouping, the next updates do not wait for a reboot."""
+        settings = [
+            {'component': 'bmc', 'url': 'http://bmc/v1.0.0',
+             'task_monitor': '/tasks/1',
+             'bmc_check_start_time': '2025-01-01T00:00:00.000000'},
+            {'component': 'nic:BCM57414', 'url': 'http://nic/v1.0.0'}
+        ]
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            task.node.set_driver_internal_info(
+                'bmc_fw_version_before_update', '1.0.0')
+            task.node.set_driver_internal_info(
+                'redfish_fw_updates', settings)
+            task.node.set_driver_internal_info(redfish_fw.GROUPING, True)
+            mock_get_bmc_version.return_value = '2.0.0'
+
+            firmware_interface = redfish_fw.RedfishFirmware()
+            firmware_interface._handle_bmc_update_completion(
+                task, mock_get_update_service.return_value,
+                settings, settings[0])
+
+            self.assertNotIn('firmware_reboot_requested',
+                             task.node.driver_internal_info)
+            mock_power_action.assert_not_called()
+            mock_continue_updates.assert_called_once_with(
+                firmware_interface, task,
+                mock_get_update_service.return_value, settings)
+
     @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_updates',
                        autospec=True)
     @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
@@ -2736,7 +2774,7 @@ class RedfishFirmwareVerifyTestCase(db_base.DbTestCase):
         tm_mock.return_value = self._task_monitor(sushy.TASK_STATE_RUNNING)
         self._poll(self._verify())
         continue_mock.assert_not_called()
-        self.assertEqual('its task is still Running', self.waiting)
+        self.assertEqual('the bios task is still Running', self.waiting)
 
     @mock.patch.object(manager_utils, 'cleaning_error_handler', autospec=True)
     @mock.patch.object(redfish_utils, 'get_task_monitor', autospec=True)
@@ -3069,13 +3107,13 @@ class RedfishFirmwareVerifyTestCase(db_base.DbTestCase):
         tm_mock.return_value = self._task_monitor(sushy.TASK_STATE_RUNNING)
         verify = self._verify()
         self._poll(verify)
-        self.assertEqual('its task is still Running', self.waiting)
+        self.assertEqual('the bios task is still Running', self.waiting)
 
         tm_mock.return_value = self._task_monitor()
         self._poll(verify)
         self.assertEqual('BootProgress is MemoryInitializationStarted',
                          self.waiting)
-        self.assertEqual(['its task is still Running',
+        self.assertEqual(['the bios task is still Running',
                           'BootProgress is MemoryInitializationStarted'],
                          waits(log_mock.debug))
         self.assertEqual([], waits(log_mock.info))
@@ -3157,7 +3195,7 @@ class RedfishFirmwareVerifyTestCase(db_base.DbTestCase):
         verify = self._verify(before={'state': None})
         self._poll(verify)
         continue_mock.assert_not_called()
-        self.assertEqual('its task could not be read', self.waiting)
+        self.assertEqual('the bios task could not be read', self.waiting)
 
     @mock.patch.object(redfish_fw.RedfishFirmware, '_continue_updates',
                        autospec=True)
@@ -3304,7 +3342,8 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
     def _verify(self, **fields):
         verify = {'reboot_time': self.now.isoformat(),
                   'before': {'state': 'OSRunning'},
-                  'new_boot': False, 'boot_passed': False}
+                  'new_boot': False, 'boot_passed': False,
+                  'failed': None}
         verify.update(fields)
         return verify
 
@@ -3665,7 +3704,7 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
         self._advance(100000)
         self._poll()
         self._assert_waiting(redfish_fw.PHASE_APPLYING)
-        self.assertIn('its task is still', self.waiting)
+        self.assertIn('the bios task is still', self.waiting)
 
         error = exception.RedfishConnectionError(node=self.node.uuid,
                                                  error='timeout')
@@ -3917,6 +3956,7 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
         update_service = self.mocks['update_service'].return_value
         cases = [
             (self._update(), staging_mock),
+            (self._update(phase=redfish_fw.PHASE_STAGED), staging_mock),
             (self._update('nic:NIC.1', phase=redfish_fw.PHASE_APPLYING),
              applying_mock),
             (self._update('bmc', phase=redfish_fw.PHASE_APPLYING),
@@ -3932,7 +3972,7 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
 
             if expected is staging_mock:
                 staging_mock.assert_called_once_with(
-                    self.firmware, task, [fw_upd])
+                    self.firmware, task, update_service, [fw_upd])
             elif expected is applying_mock:
                 applying_mock.assert_called_once_with(
                     self.firmware, task, update_service, [fw_upd], fw_upd)
@@ -3955,6 +3995,18 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
 
             self._assert_failed('cannot be resumed')
             self.mocks['task_monitor'].assert_not_called()
+
+    def test_grouped_submission_interrupted_fails(self):
+        # The conductor stopped after the first update was staged, while
+        # submitting the next: the next one's task is unknown.
+        self._grouped(
+            self._update('bios', phase=redfish_fw.PHASE_STAGED),
+            self._update('nic:NIC.1', phase=None, task_monitor=None))
+
+        self._poll()
+
+        self._assert_failed('conductor stopped while submitting')
+        self.mocks['task_monitor'].assert_not_called()
 
     def test_check_verify_from_earlier_version(self):
         # Rebooted to apply by the version without update phases, which
@@ -4151,6 +4203,132 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
         self.assertEqual(redfish_fw.PHASE_APPLYING,
                          self._updates()[0]['phase'])
 
+    # Grouping updates to share reboots
+
+    @staticmethod
+    def _tm(name):
+        return '/tasks/%s' % name
+
+    def _grouped(self, *updates, **info):
+        info[redfish_fw.GROUPING] = True
+        self._set_updates(*updates, **info)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    def test_update_grouping_validation(self, execute_mock):
+        bios = {'component': 'bios', 'url': 'http://fw/bios.bin'}
+        nic = {'component': 'nic:NIC.1', 'url': 'http://fw/nic.bin'}
+        bmc = {'component': 'bmc', 'url': 'http://fw/bmc.bin'}
+        rejected = [
+            ([bios], 'maybe'),
+            ([bios], 2),
+            ([bios], None),
+            ([bios, dict(bios)], True),
+            ([dict(nic, wait=60), bios], True),
+            ([bios, bmc], True),
+        ]
+        for settings, grouping in rejected:
+            with task_manager.acquire(self.context, self.node.uuid,
+                                      shared=False) as task:
+                self.assertRaises(exception.InvalidParameterValue,
+                                  self.firmware.update, task, settings,
+                                  allow_grouping_reboots=grouping)
+        execute_mock.assert_not_called()
+
+        accepted = [
+            ([dict(nic, wait=60), bios], False),
+            ([dict(bmc, wait=60), bios, nic], True),
+            ([bios, bmc], False),
+            ([bios, dict(bios)], False),
+            ([bios, dict(bios)], 'false'),
+            ([bios, nic], 'true'),
+        ]
+        for settings, grouping in accepted:
+            with task_manager.acquire(self.context, self.node.uuid,
+                                      shared=False) as task:
+                self.assertEqual(
+                    states.CLEANWAIT,
+                    self.firmware.update(task, settings,
+                                         allow_grouping_reboots=grouping))
+        self.assertEqual(len(accepted), execute_mock.call_count)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware, '_execute_firmware_update',
+                       autospec=True)
+    def test_update_grouping_flag(self, execute_mock):
+        settings = [{'component': 'bios', 'url': 'http://fw/bios.bin'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.firmware.update(task, settings,
+                                 allow_grouping_reboots='true')
+        self.node.refresh()
+        self.assertTrue(self.node.driver_internal_info[redfish_fw.GROUPING])
+
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.firmware.update(task, settings)
+        self.node.refresh()
+        self.assertNotIn(redfish_fw.GROUPING, self.node.driver_internal_info)
+
+        # Removed with the updates
+        self._grouped(self._update())
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.firmware._clear_updates(task.node)
+        self.node.refresh()
+        self.assertNotIn(redfish_fw.GROUPING, self.node.driver_internal_info)
+
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    def test_grouping_stages_updates_for_one_reboot(self, collection_mock):
+        collection_mock.return_value.members_identities = ['/Systems/1']
+        update_service = self._submits('JID_2')
+        tasks = self._fake_tasks()
+        self._grouped(self._update(task_monitor=self._tm('JID_1')),
+                      {'component': 'nic:NIC.1', 'url': 'http://fw/nic.bin'})
+
+        # BIOS staged: the NIC update is submitted to share its reboot
+        tasks[self._tm('JID_1')] = sushy.TASK_STATE_COMPLETED
+        self._poll()
+        update_service.simple_update.assert_called_once_with(
+            'http://fw/nic.bin')
+        self.assertEqual([redfish_fw.PHASE_STAGED, redfish_fw.PHASE_STAGING],
+                         [u.get('phase') for u in self._updates()])
+        self.mocks['power'].assert_not_called()
+
+        # The NIC is polled next, while the BIOS update stays staged
+        tasks[self._tm('JID_2')] = sushy.TASK_STATE_RUNNING
+        self._poll()
+        self.assertEqual(redfish_fw.PHASE_STAGING,
+                         self._updates()[1]['phase'])
+        self.mocks['power'].assert_not_called()
+
+        # NIC staged: it is the last update, so one reboot applies both
+        tasks[self._tm('JID_2')] = sushy.TASK_STATE_COMPLETED
+        task = self._poll()
+
+        self.mocks['power'].assert_called_once_with(task, states.REBOOT, 300)
+        updates = self._updates()
+        self.assertEqual([redfish_fw.PHASE_APPLYING] * 2,
+                         [u.get('phase') for u in updates])
+        self.assertEqual(self._verify(), updates[0][redfish_fw.VERIFY])
+        self.assertEqual(['JID_1', 'JID_2'], self._lc_jids())
+        self.assertNotIn(redfish_fw.VERIFY, updates[1])
+        self.assertEqual(1, update_service.simple_update.call_count)
+
+    def test_grouping_last_update_reboots_group(self):
+        # The last update closes the group; a task that disappeared while
+        # staging counts as staged.
+        self._grouped(self._update(phase=redfish_fw.PHASE_STAGED),
+                      self._update('nic:NIC.1', task_monitor='/tasks/nic'))
+        self._task_gone()
+
+        self._poll()
+
+        self.mocks['power'].assert_called_once()
+        self.assertEqual([redfish_fw.PHASE_APPLYING] * 2,
+                         [u['phase'] for u in self._updates()])
+        update_service = self.mocks['update_service'].return_value
+        update_service.simple_update.assert_not_called()
+
     def test_one_reboot_per_update(self):
         self._set_updates(self._update(),
                           {'component': 'nic:NIC.1',
@@ -4163,3 +4341,337 @@ class RedfishFirmwareStageThenRebootTestCase(db_base.DbTestCase):
         self.assertNotIn('phase', self._updates()[1])
         update_service = self.mocks['update_service'].return_value
         update_service.simple_update.assert_not_called()
+
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    def test_grouping_submit_failure_names_staged(self, collection_mock):
+        collection_mock.return_value.members_identities = ['/Systems/1']
+        update_service = self.mocks['update_service'].return_value
+        errors = [
+            sushy.exceptions.HTTPError(
+                method='POST', url='http://bmc/update',
+                response=mock.Mock(status_code=400, json=mock.Mock(
+                    return_value={}))),
+            sushy.exceptions.ConnectionError(url='http://bmc/update',
+                                             error='timeout'),
+        ]
+        for error in errors:
+            update_service.simple_update.reset_mock()
+            update_service.simple_update.side_effect = error
+            self.mocks['clean_error'].reset_mock()
+            self._grouped(
+                self._update(phase=redfish_fw.PHASE_STAGED),
+                self._update('nic:NIC.1', task_monitor='/tasks/nic'),
+                {'component': 'nic:NIC.2', 'url': 'http://fw/nic2.bin'})
+            self._set_task(sushy.TASK_STATE_COMPLETED)
+
+            self._poll()
+
+            update_service.simple_update.assert_called_once_with(
+                'http://fw/nic2.bin')
+            # Not even a rejected request lifts the hold: firmware is
+            # staged
+            self._assert_failed('Failed to submit nic:NIC.2 firmware')
+            self.assertIn('Firmware for bios, nic:NIC.1 is already staged',
+                          self.mocks['clean_error'].call_args[0][1])
+            self.assertNotIn(redfish_fw.GROUPING,
+                             self.node.driver_internal_info)
+
+    def test_grouping_staging_failure_names_staged(self):
+        self._grouped(self._update(phase=redfish_fw.PHASE_STAGED),
+                      self._update('nic:NIC.1', task_monitor='/tasks/nic'))
+        self._set_task(sushy.TASK_STATE_EXCEPTION, sushy.HEALTH_CRITICAL,
+                       message='Image download failed')
+
+        self._poll()
+
+        self._assert_failed('Image download failed')
+        self.assertIn('Firmware for bios is already staged',
+                      self.mocks['clean_error'].call_args[0][1])
+
+    def _applying_group(self, *names, **verify):
+        """Updates of a group just rebooted to apply them."""
+        updates = [self._update(name.split('@')[0], task_monitor=self._tm(
+            name.split('@')[-1]), phase=redfish_fw.PHASE_APPLYING)
+            for name in names]
+        updates[0][redfish_fw.VERIFY] = self._verify(**verify)
+        return updates
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    def test_grouped_applying_waits_for_every_task(
+            self, resume_mock, validate_mock, cache_mock):
+        tasks = self._fake_tasks()
+        self._grouped(*self._applying_group('bios', 'nic:NIC.1@nic'))
+        self._reset_host()
+
+        tasks['/tasks/bios'] = sushy.TASK_STATE_COMPLETED
+        tasks['/tasks/nic'] = sushy.TASK_STATE_RUNNING
+        self._poll()
+        self._assert_waiting(redfish_fw.PHASE_APPLYING)
+        resume_mock.assert_not_called()
+
+        # Every task done: the whole group is done
+        tasks['/tasks/nic'] = None
+        self._poll()
+
+        resume_mock.assert_called_once()
+        validate_mock.assert_not_called()
+        self.mocks['power'].assert_not_called()
+
+    def test_grouped_applying_task_failed(self):
+        self._grouped(*self._applying_group('bios', 'nic:NIC.1@nic'))
+        self._reset_host()
+        sushy_tasks = {
+            '/tasks/bios': mock.Mock(task_state=sushy.TASK_STATE_COMPLETED,
+                                     task_status=sushy.HEALTH_OK,
+                                     messages=[]),
+            '/tasks/nic': mock.Mock(task_state=sushy.TASK_STATE_EXCEPTION,
+                                    task_status=sushy.HEALTH_CRITICAL,
+                                    messages=[mock.Mock(
+                                        message='NIC flash failed')]),
+        }
+        self.mocks['task_monitor'].side_effect = lambda node, uri: mock.Mock(
+            get_task=mock.Mock(return_value=sushy_tasks[uri]))
+
+        self._poll()
+
+        self._assert_failed('NIC flash failed')
+
+    def test_grouped_applying_task_failed_waits_for_running(self):
+        self._grouped(*self._applying_group('bios', 'nic:NIC.1@nic'))
+        self._reset_host()
+        nic_task = mock.Mock(task_state=sushy.TASK_STATE_RUNNING,
+                             task_status=sushy.HEALTH_OK, messages=[])
+        sushy_tasks = {
+            '/tasks/bios': mock.Mock(task_state=sushy.TASK_STATE_EXCEPTION,
+                                     task_status=sushy.HEALTH_CRITICAL,
+                                     messages=[mock.Mock(
+                                         message='BIOS flash failed')]),
+            '/tasks/nic': nic_task,
+        }
+        self.mocks['task_monitor'].side_effect = lambda node, uri: mock.Mock(
+            get_task=mock.Mock(return_value=sushy_tasks[uri]))
+
+        # The NIC is still being applied, so the failure waits for it
+        self._poll()
+        self._assert_waiting(redfish_fw.PHASE_APPLYING)
+        self.assertIn('nic:NIC.1 task is still Running',
+                      self.waiting)
+
+        nic_task.task_state = sushy.TASK_STATE_COMPLETED
+        self._poll()
+
+        self._assert_failed('BIOS flash failed')
+
+    def test_grouped_applying_failure_kept_when_task_disappears(self):
+        # A failed task is seen while another is still being applied, and
+        # the BMC deletes it before the other finishes. The failure must
+        # not be forgotten, whichever task the group lists first.
+        for names in (('bios', 'nic:NIC.1@nic'), ('nic:NIC.1@nic', 'bios')):
+            with self.subTest(order=names):
+                self.mocks['clean_error'].reset_mock()
+                self._grouped(*self._applying_group(*names))
+                self._reset_host()
+                nic_task = mock.Mock(task_state=sushy.TASK_STATE_RUNNING,
+                                     task_status=sushy.HEALTH_OK,
+                                     messages=[])
+                sushy_tasks = {
+                    '/tasks/bios': mock.Mock(
+                        task_state=sushy.TASK_STATE_EXCEPTION,
+                        task_status=sushy.HEALTH_CRITICAL,
+                        messages=[mock.Mock(message='BIOS flash failed')]),
+                    '/tasks/nic': nic_task,
+                }
+
+                def get_task_monitor(node, uri):
+                    if sushy_tasks.get(uri) is None:
+                        raise exception.RedfishResourceNotFound(
+                            error='gone')
+                    return mock.Mock(get_task=mock.Mock(
+                        return_value=sushy_tasks[uri]))
+
+                self.mocks['task_monitor'].side_effect = get_task_monitor
+
+                self._poll()
+                self._assert_waiting(redfish_fw.PHASE_APPLYING)
+
+                sushy_tasks['/tasks/bios'] = None
+                nic_task.task_state = sushy.TASK_STATE_COMPLETED
+                self._poll()
+
+                self._assert_failed('BIOS flash failed')
+
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    def test_grouped_staging_interrupted_does_not_resubmit(
+            self, collection_mock):
+        # The conductor stops while submitting the next update of the
+        # group, after the BMC accepted it but before its task was
+        # recorded. After the restart it must not be submitted again.
+        collection_mock.return_value.members_identities = ['/Systems/1']
+        update_service = self.mocks['update_service'].return_value
+        update_service.simple_update.side_effect = RuntimeError('stopped')
+        tasks = self._fake_tasks()
+        self._grouped(self._update(task_monitor=self._tm('JID_1')),
+                      {'component': 'nic:NIC.1', 'url': 'http://fw/nic.bin'})
+        tasks[self._tm('JID_1')] = sushy.TASK_STATE_COMPLETED
+
+        self.assertRaises(RuntimeError, self._poll)
+        update_service.simple_update.assert_called_once_with(
+            'http://fw/nic.bin')
+
+        update_service.simple_update.side_effect = None
+        self.node.refresh()
+        self._poll()
+
+        self._assert_failed('conductor stopped while submitting')
+        update_service.simple_update.assert_called_once()
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(redfish_fw.drac_fw, 'check_lc_jobs', autospec=True)
+    def test_grouped_applying_dell_lc_jobs(self, lc_jobs_mock, resume_mock,
+                                           cache_mock):
+        self._task_gone()
+        self._grouped(*self._applying_group('bios@JID_1', 'nic:NIC.1@JID_2'),
+                      firmware_lc_jids=['JID_1', 'JID_2'])
+        self._reset_host()
+
+        lc_jobs_mock.return_value = (drac_fw.LCJobStatus.RUNNING, 'JID_2')
+        task = self._poll()
+        lc_jobs_mock.assert_called_once_with(task, ['JID_1', 'JID_2'])
+        self._assert_waiting(redfish_fw.PHASE_APPLYING)
+
+        lc_jobs_mock.return_value = (drac_fw.LCJobStatus.ERROR,
+                                     'JID_2: failed')
+        self._poll()
+        self._assert_failed('JID_2: failed')
+        self.assertIn('bios, nic:NIC.1',
+                      self.mocks['clean_error'].call_args[0][1])
+        resume_mock.assert_not_called()
+
+    @mock.patch.object(redfish_fw.drac_fw, 'check_lc_jobs', autospec=True)
+    def test_grouped_applying_task_failed_waits_for_lc_jobs(self,
+                                                            lc_jobs_mock):
+        self._grouped(*self._applying_group('bios@JID_1', 'nic:NIC.1@JID_2'),
+                      firmware_lc_jids=['JID_1', 'JID_2'])
+        self._reset_host()
+
+        def get_task_monitor(node, uri):
+            if uri.endswith('JID_1'):
+                sushy_task = mock.Mock(
+                    task_state=sushy.TASK_STATE_EXCEPTION,
+                    task_status=sushy.HEALTH_CRITICAL,
+                    messages=[mock.Mock(message='BIOS flash failed')])
+            else:
+                sushy_task = mock.Mock(task_state=sushy.TASK_STATE_COMPLETED,
+                                       task_status=sushy.HEALTH_OK,
+                                       messages=[])
+            return mock.Mock(get_task=mock.Mock(return_value=sushy_task))
+
+        self.mocks['task_monitor'].side_effect = get_task_monitor
+
+        # Every task has finished, but the NIC job is still applying it
+        lc_jobs_mock.return_value = (drac_fw.LCJobStatus.RUNNING, 'JID_2')
+        self._poll()
+        self._assert_waiting(redfish_fw.PHASE_APPLYING)
+
+        lc_jobs_mock.return_value = (drac_fw.LCJobStatus.ERROR,
+                                     'JID_1: failed')
+        self._poll()
+        self._assert_failed('BIOS flash failed')
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(redfish_fw, 'LOG', autospec=True)
+    def test_grouped_last_group_resumes(self, log_mock, resume_mock,
+                                        validate_mock, cache_mock):
+        tasks = self._fake_tasks()
+        self._grouped(*self._applying_group('bios', 'nic:NIC.1@nic'))
+        self._reset_host()
+        tasks['/tasks/bios'] = sushy.TASK_STATE_COMPLETED
+
+        self._poll()
+
+        messages = [c[0][0] % c[0][1] for c in log_mock.info.call_args_list]
+        warnings = [c[0][0] % c[0][1]
+                    for c in log_mock.warning.call_args_list]
+        self.assertIn('The nic:NIC.1 firmware update task is gone from node '
+                      '%s after the reboot to apply it, so its outcome is '
+                      'unknown. Verifying the update with the remaining '
+                      'checks.' % self.node.uuid, warnings)
+        self.assertEqual(
+            ['bios, nic:NIC.1 firmware update applied on node %s.'
+             % self.node.uuid],
+            [m for m in messages if 'applied on node' in m])
+        resume_mock.assert_called_once()
+        validate_mock.assert_not_called()
+        self.assertNotIn('redfish_fw_updates', self.node.driver_internal_info)
+        self.assertNotIn(redfish_fw.GROUPING, self.node.driver_internal_info)
+
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       'cache_firmware_components', autospec=True)
+    @mock.patch.object(redfish_fw.RedfishFirmware,
+                       '_validate_resources_stability', autospec=True)
+    @mock.patch.object(manager_utils, 'notify_conductor_resume_clean',
+                       autospec=True)
+    @mock.patch.object(redfish_utils, 'get_manager', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system_collection', autospec=True)
+    def test_update_grouped_end_to_end(
+            self, collection_mock, manager_mock, resume_mock,
+            validate_mock, cache_mock):
+        collection_mock.return_value.members_identities = ['/Systems/1']
+        manager_mock.return_value.firmware_version = '1.0'
+        names = ('bmc', 'bios', 'nic1', 'nic2')
+        update_service = self._submits(*names)
+        tasks = self._fake_tasks()
+        self._reset_on_reboot()
+
+        settings = [{'component': 'bmc', 'url': 'http://fw/bmc.bin'},
+                    {'component': 'bios', 'url': 'http://fw/bios.bin'},
+                    {'component': 'nic:NIC.1', 'url': 'http://fw/nic1.bin'},
+                    {'component': 'nic:NIC.2', 'url': 'http://fw/nic2.bin'}]
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=False) as task:
+            self.firmware.update(task, settings, allow_grouping_reboots=True)
+        self.node.refresh()
+
+        def stage_and_poll(name):
+            tasks['/tasks/' + name] = sushy.TASK_STATE_COMPLETED
+            self._poll()
+
+        # The BMC applies its own update without a reboot; once it is
+        # stable, the BIOS update is submitted
+        tasks['/tasks/bmc'] = sushy.TASK_STATE_COMPLETED
+        self._advance(CONF.redfish.firmware_update_reboot_delay)
+        manager_mock.return_value.firmware_version = '2.0'
+        self._poll()
+        self.mocks['power'].assert_not_called()
+        self.assertEqual('bios', self._updates()[0]['component'])
+        validate_mock.assert_called_once()
+
+        # The other updates are staged, then applied by one reboot
+        stage_and_poll('bios')
+        stage_and_poll('nic1')
+        self.mocks['power'].assert_not_called()
+        stage_and_poll('nic2')
+        self.assertEqual(1, self.mocks['power'].call_count)
+        self._poll()
+
+        self.mocks['power'].assert_called_once_with(mock.ANY, states.REBOOT,
+                                                    300)
+        self.assertEqual(4, update_service.simple_update.call_count)
+        validate_mock.assert_called_once()
+        resume_mock.assert_called_once()
+        self.mocks['clean_error'].assert_not_called()
+        self.assertNotIn('redfish_fw_updates', self.node.driver_internal_info)
+        self.assertNotIn(redfish_fw.GROUPING, self.node.driver_internal_info)

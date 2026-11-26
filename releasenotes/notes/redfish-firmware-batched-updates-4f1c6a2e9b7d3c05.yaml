@@ -1,0 +1,17 @@
+---
+features:
+  - |
+    The Redfish ``firmware.update`` step accepts a new boolean argument,
+    ``allow_grouping_reboots``. When set, adjacent updates of components
+    other than the BMC are staged one after another and applied by a
+    single reboot, instead of one reboot each. For example
+    ``[bmc, bios, nic:NIC.1, nic:NIC.2]`` needs one reboot instead of
+    four. With grouping, a BMC update must come first, as vendors
+    generally recommend, and the node is not rebooted after it before the
+    next updates are staged.
+    Hardware that needs this reboot before it can update device firmware,
+    such as some PLDM-based NICs, should have its BMC updated in a
+    separate step or without grouping. With grouping, a component may
+    appear only once, and only BMC components may set ``wait``. If staging
+    fails, the step fails without rebooting the node. The default,
+    ``False``, keeps one reboot per component.
