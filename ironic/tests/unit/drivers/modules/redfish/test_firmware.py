@@ -834,8 +834,8 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             bmc_component['wait'] = wait
             bios_component['wait'] = wait
 
-        self.node.clean_step = {'priority': 100, 'interface': 'bios',
-                                'step': 'apply_configuration',
+        self.node.clean_step = {'priority': 100, 'interface': 'firmware',
+                                'step': 'update',
                                 'argsinfo': {'settings': []}}
 
         updates = []
@@ -873,8 +873,8 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             bmc_component['wait'] = wait
             bios_component['wait'] = wait
 
-        self.node.service_step = {'priority': 100, 'interface': 'bios',
-                                  'step': 'apply_configuration',
+        self.node.service_step = {'priority': 100, 'interface': 'firmware',
+                                  'step': 'update',
                                   'argsinfo': {'settings': []}}
 
         updates = []
@@ -932,6 +932,70 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
     def test_redfish_fw_updates(self):
         self._generate_new_driver_internal_info(['bmc'])
         self._test__query_methods()
+
+    def test__query_update_failed_without_maintenance(self):
+        # A failed deployment does not set maintenance, and the updates it
+        # leaves must be discarded too.
+        firmware = redfish_fw.RedfishFirmware()
+        mock_manager = mock.Mock()
+        mock_manager.iter_nodes.return_value = []
+
+        firmware._query_update_failed(mock_manager, self.context)
+
+        filters = mock_manager.iter_nodes.call_args.kwargs['filters']
+        self.assertNotIn('maintenance', filters)
+        self.assertEqual([states.CLEANFAIL, states.DEPLOYFAIL,
+                          states.SERVICEFAIL], filters['provision_state_in'])
+
+    @mock.patch.object(manager_utils, 'deploying_error_handler',
+                       autospec=True)
+    @mock.patch.object(manager_utils, 'servicing_error_handler',
+                       autospec=True)
+    @mock.patch.object(manager_utils, 'cleaning_error_handler', autospec=True)
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_update_service', autospec=True)
+    def test__check_node_redfish_firmware_update_other_step(
+            self, update_service_mock, power_mock, clean_error_mock,
+            service_error_mock, deploy_error_mock):
+        # Updates left by an operation that ended without clearing them,
+        # while the node waits in another step, are discarded.
+        firmware = redfish_fw.RedfishFirmware()
+        other = {'interface': 'deploy', 'step': 'erase_devices'}
+        cases = [
+            (states.CLEANWAIT, {'clean_step': other}),
+            (states.DEPLOYWAIT, {'deploy_step': other}),
+            (states.SERVICEWAIT, {'service_step': other}),
+            (states.DEPLOYWAIT, {}),
+        ]
+        for provision_state, steps in cases:
+            with self.subTest(provision_state=provision_state, steps=steps):
+                self.node.provision_state = provision_state
+                self.node.clean_step = steps.get('clean_step', {})
+                self.node.deploy_step = steps.get('deploy_step', {})
+                self.node.service_step = steps.get('service_step', {})
+                self.node.driver_internal_info = {
+                    'redfish_fw_updates': [
+                        {'component': 'bios', 'url': 'http://fw/bios.bin',
+                         'task_monitor': '/tasks/1'}],
+                    'redfish_fw_update_start_time':
+                        timeutils.utcnow().isoformat(),
+                }
+                self.node.save()
+
+                with task_manager.acquire(self.context, self.node.uuid,
+                                          shared=False) as task:
+                    firmware._check_node_redfish_firmware_update(task)
+
+                self.node.refresh()
+                self.assertNotIn('redfish_fw_updates',
+                                 self.node.driver_internal_info)
+                self.assertNotIn('redfish_fw_update_start_time',
+                                 self.node.driver_internal_info)
+        update_service_mock.assert_not_called()
+        power_mock.assert_not_called()
+        clean_error_mock.assert_not_called()
+        service_error_mock.assert_not_called()
+        deploy_error_mock.assert_not_called()
 
     def test_redfish_fw_updates_empty(self):
         self._generate_new_driver_internal_info(invalid=True)
@@ -2738,6 +2802,8 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
             # Set nic_needs_post_completion_reboot to simulate hardware
             # that started update immediately but needs reboot after completion
             settings[0]['nic_needs_post_completion_reboot'] = True
+            task.node.clean_step = {'interface': 'firmware',
+                                    'step': 'update'}
             task.node.set_driver_internal_info(
                 'redfish_fw_updates', settings)
 
@@ -2783,6 +2849,8 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
+            task.node.clean_step = {'interface': 'firmware',
+                                    'step': 'update'}
             task.node.set_driver_internal_info(
                 'redfish_fw_updates', settings)
 
@@ -2830,6 +2898,8 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
+            task.node.clean_step = {'interface': 'firmware',
+                                    'step': 'update'}
             task.node.set_driver_internal_info(
                 'redfish_fw_updates', settings)
 
@@ -2879,6 +2949,8 @@ class RedfishFirmwareTestCase(db_base.DbTestCase):
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=False) as task:
+            task.node.clean_step = {'interface': 'firmware',
+                                    'step': 'update'}
             task.node.set_driver_internal_info(
                 'redfish_fw_updates', settings)
 

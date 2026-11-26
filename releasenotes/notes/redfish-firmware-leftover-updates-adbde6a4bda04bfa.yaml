@@ -1,0 +1,12 @@
+---
+fixes:
+  - |
+    Firmware updates recorded by the Redfish ``firmware.update`` step are no
+    longer acted on once the operation that started them has ended without
+    clearing them, for example after a failed deployment. Previously, the
+    firmware update poll could act on them while the node waited in a
+    later, unrelated step, failing that step or rebooting the node, and
+    power state synchronization and fast track stayed disabled for the
+    node. Such updates are now discarded when the node waits in any step
+    other than ``firmware.update``, and when the node has failed, whether
+    or not it is in maintenance.

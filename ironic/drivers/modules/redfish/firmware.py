@@ -1059,17 +1059,17 @@ class RedfishFirmware(base.FirmwareInterface):
         purpose='checking if async update of firmware component failed',
         spacing=CONF.redfish.firmware_update_fail_interval,
         filters={'reserved': False, 'provision_state_in': [states.CLEANFAIL,
-                 states.DEPLOYFAIL, states.SERVICEFAIL], 'maintenance': True},
+                 states.DEPLOYFAIL, states.SERVICEFAIL]},
         predicate_extra_fields=['driver_internal_info'],
         predicate=lambda n: n.driver_internal_info.get('redfish_fw_updates'),
     )
     def _query_update_failed(self, task, manager, context):
 
         """Periodic job to check for failed firmware updates."""
-        # A firmware update failed. Discard any remaining firmware
-        # updates so when the user takes the node out of
-        # maintenance mode, pending firmware updates do not
-        # automatically continue.
+        # A firmware update failed, or the operation that started it
+        # failed without clearing it, as a failed deployment does without
+        # setting maintenance. Discard any remaining firmware updates so
+        # that they do not continue when the node is used again.
         LOG.error('Update firmware failed for node %(node)s. '
                   'Discarding remaining firmware updates.',
                   {'node': task.node.uuid})
@@ -2017,6 +2017,20 @@ class RedfishFirmware(base.FirmwareInterface):
         # the node.
         task.upgrade_lock()
         node = task.node
+
+        # The updates may have been left by an operation that ended
+        # without clearing them, while the node now waits in another step.
+        step = node.clean_step or node.service_step or node.deploy_step
+        if not step or (step.get('interface'), step.get('step')) != (
+                'firmware', 'update'):
+            LOG.warning('Discarding the firmware updates recorded for node '
+                        '%(node)s, as its current step %(step)s is not the '
+                        'firmware update that recorded them.',
+                        {'node': node.uuid,
+                         'step': ('%(interface)s.%(step)s' % step
+                                  if step else 'none')})
+            self._clear_updates(node)
+            return
 
         # Check overall timeout for firmware update operation
         if self._check_overall_timeout(task):
